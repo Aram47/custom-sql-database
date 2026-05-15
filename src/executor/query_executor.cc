@@ -4,7 +4,10 @@
 #include <cmath>
 #include <numeric>
 
+#include "executor/group_aggregate_operator.h"
+#include "executor/select_analysis.h"
 #include "executor/select_expression_evaluator.h"
+#include "executor/select_pipeline.h"
 #include "types/type_converter.h"
 
 namespace db {
@@ -34,41 +37,44 @@ SelectExecutor::SelectExecutor(std::shared_ptr<SelectStatement> stmt,
     : stmt_(stmt), table_(table) {}
 
 QueryResult SelectExecutor::execute() {
-  QueryResult result;
-  result.success = true;
-
   if (!table_) {
     return QueryResult::error_result("Table not found");
   }
 
-  std::vector<Row> all_rows = table_->get_all_rows();
+  if (auto validation_err = validate_select_for_grouping(stmt_)) {
+    return QueryResult::error_result(*validation_err);
+  }
 
   SelectExpressionEvaluator eval =
       evaluator_for_table(table_, stmt_->get_from_alias());
 
-  // Filter rows by WHERE clause
   std::vector<Row> filtered_rows;
-  for (const auto &row : all_rows) {
+  for (const auto &row : table_->get_all_rows()) {
     if (!stmt_->get_where_condition() ||
         eval.evaluate_condition(row, stmt_->get_where_condition())) {
       filtered_rows.push_back(row);
     }
   }
 
-  // Extract selected columns
+  if (needs_grouping(stmt_)) {
+    GroupAggregateOperator grouping(stmt_, eval);
+    QueryResult grouped = grouping.apply(filtered_rows);
+    if (!grouped.success) return grouped;
+    return SelectPipeline::apply_post_scan(std::move(grouped), stmt_, eval);
+  }
+
+  QueryResult result;
+  result.success = true;
+
   const auto &select_cols = stmt_->get_select_columns();
   if (select_cols.empty()) {
     return QueryResult::error_result("No columns selected");
   }
 
   const auto isWildcardColumn = [](const ExpressionPtr &e) -> bool {
-    auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(e);
-    if (col_ref && col_ref->get_column() == "*") return true;
-    auto ident = std::dynamic_pointer_cast<IdentifierExpression>(e);
-    return ident && ident->get_name() == "*";
+    return is_wildcard_select_expression(e);
   };
 
-  // Build result column names
   for (const auto &[expr, alias] : select_cols) {
     if (isWildcardColumn(expr)) {
       for (const auto &col : table_->get_columns()) {
@@ -81,11 +87,10 @@ QueryResult SelectExecutor::execute() {
     }
   }
 
-  // Build result rows
   for (const auto &row : filtered_rows) {
     std::vector<Value> resultRow;
-
     for (const auto &[expr, alias] : select_cols) {
+      (void)alias;
       if (isWildcardColumn(expr)) {
         for (size_t i = 0; i < row.get_column_count(); ++i) {
           resultRow.push_back(row.get_value(i));
@@ -94,38 +99,12 @@ QueryResult SelectExecutor::execute() {
         resultRow.push_back(eval.evaluate_expression(row, expr, nullptr));
       }
     }
-
-    result.rows.push_back(resultRow);
+    result.rows.push_back(std::move(resultRow));
   }
 
-  // Apply DISTINCT (sort so std::unique removes all duplicates)
-  if (stmt_->is_distinct()) {
-    const auto rowLess = [](const std::vector<Value> &a,
-                            const std::vector<Value> &b) {
-      const size_t n = std::min(a.size(), b.size());
-      for (size_t i = 0; i < n; ++i) {
-        if (!(a[i] == b[i])) return a[i] < b[i];
-      }
-      return a.size() < b.size();
-    };
-    const auto rowEqual = [](const std::vector<Value> &a,
-                             const std::vector<Value> &b) {
-      if (a.size() != b.size()) return false;
-      for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i] != b[i]) return false;
-      }
-      return true;
-    };
-    std::sort(result.rows.begin(), result.rows.end(), rowLess);
-    const auto last =
-        std::unique(result.rows.begin(), result.rows.end(), rowEqual);
-    result.rows.erase(last, result.rows.end());
-  }
-
-  result.affected_rows = result.rows.size();
+  result.affected_rows = static_cast<int>(result.rows.size());
   result.message = "SELECT OK";
-
-  return result;
+  return SelectPipeline::apply_post_scan(std::move(result), stmt_, eval);
 }
 
 // ==================== InsertExecutor ====================

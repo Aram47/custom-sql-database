@@ -146,7 +146,11 @@ TEST(DatabaseExtendedTest, ScalarFunctionsInSelect) {
   auto cnt = db.execute_query("SELECT COUNT(id) FROM t");
   ASSERT_TRUE(cnt.success) << cnt.message;
   ASSERT_EQ(cnt.rows.size(), 1u);
-  EXPECT_EQ(cnt.rows[0][0].as_int(), 1);  // simplified COUNT semantics
+  EXPECT_EQ(cnt.rows[0][0].as_int(), 1);
+
+  auto cnt_star = db.execute_query("SELECT COUNT(*) FROM t");
+  ASSERT_TRUE(cnt_star.success) << cnt_star.message;
+  EXPECT_EQ(cnt_star.rows[0][0].as_int(), 1);
 }
 
 TEST(DatabaseExtendedTest, FloatBooleanDateUuidColumns) {

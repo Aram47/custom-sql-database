@@ -3,7 +3,10 @@
 #include <algorithm>
 
 #include "core/database.h"
+#include "executor/group_aggregate_operator.h"
+#include "executor/select_analysis.h"
 #include "executor/select_expression_evaluator.h"
+#include "executor/select_pipeline.h"
 
 namespace db {
 
@@ -55,29 +58,6 @@ std::vector<SelectColumnBinding> build_bindings_for_tables(
     }
   }
   return b;
-}
-
-void sort_unique_result_rows(QueryResult &result) {
-  const auto row_less = [](const std::vector<Value> &a,
-                           const std::vector<Value> &b) {
-    const size_t n = std::min(a.size(), b.size());
-    for (size_t i = 0; i < n; ++i) {
-      if (!(a[i] == b[i])) return a[i] < b[i];
-    }
-    return a.size() < b.size();
-  };
-  const auto row_equal = [](const std::vector<Value> &a,
-                            const std::vector<Value> &b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-      if (a[i] != b[i]) return false;
-    }
-    return true;
-  };
-  std::sort(result.rows.begin(), result.rows.end(), row_less);
-  const auto last =
-      std::unique(result.rows.begin(), result.rows.end(), row_equal);
-  result.rows.erase(last, result.rows.end());
 }
 
 std::optional<std::string> validate_select_list(
@@ -170,6 +150,10 @@ QueryResult JoinSelectExecutor::execute() {
 
   auto sel_err = validate_select_list(stmt_, full_eval);
   if (sel_err) return QueryResult::error_result(*sel_err);
+
+  if (auto grouping_err = validate_select_for_grouping(stmt_)) {
+    return QueryResult::error_result(*grouping_err);
+  }
 
   /* --- Nested-loop join --- */
   std::vector<std::vector<Value>> current;
@@ -279,25 +263,35 @@ QueryResult JoinSelectExecutor::execute() {
     current = std::move(next);
   }
 
-  /* WHERE + projection */
-  const auto isWildcardColumn = [](const ExpressionPtr &e) -> bool {
-    auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(e);
-    if (col_ref && col_ref->get_column() == "*") return true;
-    auto ident = std::dynamic_pointer_cast<IdentifierExpression>(e);
-    return ident && ident->get_name() == "*";
-  };
+  std::vector<Row> filtered_rows;
+  filtered_rows.reserve(current.size());
+  for (const auto &flat : current) {
+    Row jr(flat);
+    if (stmt_->get_where_condition() &&
+        !full_eval.evaluate_condition(jr, stmt_->get_where_condition())) {
+      continue;
+    }
+    filtered_rows.push_back(std::move(jr));
+  }
 
-  result.success = true;
-  result.column_names.clear();
-  result.rows.clear();
+  if (needs_grouping(stmt_)) {
+    GroupAggregateOperator grouping(stmt_, full_eval);
+    QueryResult grouped = grouping.apply(filtered_rows);
+    if (!grouped.success) return grouped;
+    return SelectPipeline::apply_post_scan(std::move(grouped), stmt_, full_eval);
+  }
 
   const auto &select_cols = stmt_->get_select_columns();
   if (select_cols.empty()) {
     return QueryResult::error_result("No columns selected");
   }
 
+  result.success = true;
+  result.column_names.clear();
+  result.rows.clear();
+
   for (const auto &[expr, al] : select_cols) {
-    if (isWildcardColumn(expr)) {
+    if (is_wildcard_select_expression(expr)) {
       for (size_t i = 0; i < full_eval.binding_count(); ++i) {
         result.column_names.push_back(full_eval.qualified_header(i));
       }
@@ -308,36 +302,24 @@ QueryResult JoinSelectExecutor::execute() {
     }
   }
 
-  for (const auto &flat : current) {
-    Row jr(flat);
-    if (stmt_->get_where_condition()) {
-      if (!full_eval.evaluate_condition(jr, stmt_->get_where_condition())) {
-        continue;
-      }
-    }
-
+  for (const auto &jr : filtered_rows) {
     std::vector<Value> out_row;
     for (const auto &col_pair : select_cols) {
       const ExpressionPtr &expr = col_pair.first;
-      if (isWildcardColumn(expr)) {
-        for (size_t i = 0; i < flat.size(); ++i) {
-          out_row.push_back(flat[i]);
+      if (is_wildcard_select_expression(expr)) {
+        for (size_t i = 0; i < jr.get_column_count(); ++i) {
+          out_row.push_back(jr.get_value(i));
         }
       } else {
-        out_row.push_back(
-            full_eval.evaluate_expression(jr, expr, nullptr));
+        out_row.push_back(full_eval.evaluate_expression(jr, expr, nullptr));
       }
     }
     result.rows.push_back(std::move(out_row));
   }
 
-  if (stmt_->is_distinct()) {
-    sort_unique_result_rows(result);
-  }
-
   result.affected_rows = static_cast<int>(result.rows.size());
   result.message = "SELECT OK";
-  return result;
+  return SelectPipeline::apply_post_scan(std::move(result), stmt_, full_eval);
 }
 
 }  // namespace db

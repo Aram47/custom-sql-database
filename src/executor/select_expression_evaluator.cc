@@ -76,7 +76,8 @@ int SelectExpressionEvaluator::resolve_column_index(
     if (!prefix.empty()) {
       const bool pref_ok =
           (e.alias == prefix || e.physical_table == prefix);
-      if (pref_ok && e.column_name == col) {
+      if ((pref_ok && e.column_name == col) ||
+          e.column_name == prefix + "." + col) {
         matches.push_back(i);
       }
     } else {
@@ -172,6 +173,13 @@ Value SelectExpressionEvaluator::evaluate_expression(
     return Value();
   }
 
+  auto ident = std::dynamic_pointer_cast<IdentifierExpression>(expr);
+  if (ident) {
+    ColumnRefExpression cref(ident->get_name());
+    return evaluate_expression(row, std::make_shared<ColumnRefExpression>(cref),
+                               error_msg);
+  }
+
   auto bin_op = std::dynamic_pointer_cast<BinaryOpExpression>(expr);
   if (bin_op) {
     Value left = evaluate_expression(row, bin_op->get_left(), error_msg);
@@ -204,8 +212,12 @@ Value SelectExpressionEvaluator::evaluate_expression(
                    ::tolower);
 
     const auto &args = func->get_arguments();
-    if (func_name == "count" && !args.empty()) {
-      return Value(static_cast<int64_t>(1));
+    if (func_name == "count" || func_name == "sum" || func_name == "avg" ||
+        func_name == "min" || func_name == "max") {
+      if (error_msg) {
+        *error_msg = "Aggregate functions require GROUP BY or grouping context";
+      }
+      return Value();
     }
     if (func_name == "upper" && !args.empty()) {
       Value val = evaluate_expression(row, args[0], error_msg);
