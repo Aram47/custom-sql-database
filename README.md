@@ -35,14 +35,14 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 - **UPDATE** / **DELETE** — optional **WHERE** and expressions in `SET`.
 - **SELECT** — single table in **FROM**, column list or `*`, **WHERE**, expressions in the SELECT list (arithmetic, column references), **DISTINCT**.
 - Built-in scalar functions in SELECT expressions: **COUNT** (simplified semantics: returns `1` per row when an argument is present), **UPPER**, **LOWER**, **LENGTH**.
-- **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`DataType.h`](include/types/DataType.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
+- **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`DataType.h`](include/types/data_type.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
 - **Persistence**: directory of binary table files; successful mutations trigger a save.
 - **Network**: multi-client TCP server; **QUERY**, **PING**, **QUIT** commands.
 - **Client**: interactive mode and batch execution from a `.sql` file.
 
 ### Parsed by the lexer/parser but not applied by the SELECT executor
 
-These constructs are represented in the AST ([`SelectStatement`](include/parser/AST.h)), but [`SelectExecutor`](src/executor/QueryExecutor.cpp) does **not** apply them to the result:
+These constructs are represented in the AST ([`SelectStatement`](include/parser/ast.h)), but [`SelectExecutor`](src/executor/query_executor.cc) does **not** apply them to the result:
 
 - **JOIN** (`INNER` / `LEFT` / `RIGHT`, and bare `JOIN` treated as inner join at parse time).
 - **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET**.
@@ -65,7 +65,7 @@ Treat the current **SELECT** as **single-table** with filtering and **DISTINCT**
 | Platform | Linux / POSIX (`pthread`, Berkeley sockets) |
 | Dependencies | C++ standard library only—no third-party libraries |
 
-Server entry point: [`main.cpp`](main.cpp). Port **9000** and thread-pool size **4** are hard-coded literals; change defaults by editing the `Server(...)` call in `main.cpp` (or add CLI argument parsing).
+Server entry point: [`main.cc`](main.cc). Port **9000** and thread-pool size **4** are hard-coded literals; change defaults by editing the `Server(...)` call in `main.cc` (or add CLI argument parsing).
 
 ---
 
@@ -82,11 +82,11 @@ lesson_47/
 │   ├── network/       # Server, Connection, Protocol
 │   ├── types/         # Value, DataType, TypeConverter
 │   └── utils/         # Logger, Exceptions
-├── src/               # Implementations (.cpp), mirrors include/
+├── src/               # Implementations (.cc), mirrors include/
 ├── client/
-│   └── cli_client.cpp # TCP client
+│   └── cli_client.cc # TCP client
 ├── data/              # Table files (created at runtime)
-├── main.cpp
+├── main.cc
 ├── Makefile
 └── README.md
 ```
@@ -120,7 +120,7 @@ Compiler flags: `-std=c++17 -Wall -Wextra -O2 -I.`, link with `-pthread`.
 
 ```bash
 make run
-# listens on all interfaces (INADDR_ANY), port from main.cpp (default 9000)
+# listens on all interfaces (INADDR_ANY), port from main.cc (default 9000)
 # stop: Ctrl+C (SIGINT)
 ```
 
@@ -144,8 +144,8 @@ Lines starting with `#` and empty lines are ignored. A statement is assembled un
 
 | Symptom | Likely cause |
 |---------|----------------|
-| `Failed to bind socket` | Port in use or previous server still holding it—change the port in `main.cpp` or free the port (`SO_REUSEADDR` is already enabled). |
-| Client: `Connection failed` | Server not running, or wrong host/port in `cli_client.cpp` (defaults: `127.0.0.1:9000`). |
+| `Failed to bind socket` | Port in use or previous server still holding it—change the port in `main.cc` or free the port (`SO_REUSEADDR` is already enabled). |
+| Client: `Connection failed` | Server not running, or wrong host/port in `cli_client.cc` (defaults: `127.0.0.1:9000`). |
 | Empty or truncated response | Query or result larger than the receive buffer—see [Network protocol](#network-protocol). |
 | Data missing after `Ctrl+C` | Saves run after successful **INSERT**/**UPDATE**/**DELETE**/**CREATE TABLE**; abrupt termination may leave files at the last successful save only. |
 | Compile errors | Need a **C++17** compiler and POSIX headers (`unistd.h`, `sys/socket.h`). |
@@ -160,18 +160,18 @@ Client messages are UTF-8 lines terminated by `\n`. Server-side parsing: [`Proto
 
 | Kind | Format | Action |
 |------|--------|--------|
-| SQL | Line built like the CLI: protocol verb **QUERY**, a delimiter ASCII `\|` (U+007C), the SQL text, then LF `\n` | Run SQL via [`Database::executeQuery`](src/core/Database.cpp) |
+| SQL | Line built like the CLI: protocol verb **QUERY**, a delimiter ASCII `\|` (U+007C), the SQL text, then LF `\n` | Run SQL via [`Database::execute_query`](src/core/database.cc) |
 | Health check | **PING** + `\|` + payload + `\n` — delimiter required (`Protocol::parseRequest`) | Response `PONG\n` |
 | Quit | **QUIT** + `\|` + payload + `\n` | Response `OK|Goodbye\n`, session ends |
 
-[`cli_client.cpp`](client/cli_client.cpp) sends **`QUERY|...`** only.
+[`cli_client.cc`](client/cli_client.cc) sends **`QUERY|...`** only.
 
 ### Responses
 
-- Success: prefix **`OK|`**, then newline; first line is column names separated by **tab** `\t`; following lines are result rows, fields separated by `\t`. Implementation: [`Protocol::formatResponse`](src/network/Protocol.cpp).
+- Success: prefix **`OK|`**, then newline; first line is column names separated by **tab** `\t`; following lines are result rows, fields separated by `\t`. Implementation: [`Protocol::format_response`](src/network/protocol.cc).
 - Error: **`ERROR|<text>\n`**.
 
-Limitation: a single read is capped at **4096** bytes on the server ([`Connection::readMessage`](src/network/Server.cpp)) and **8192** bytes on the client when receiving—large queries or wide results need protocol changes (framing / length prefix).
+Limitation: a single read is capped at **4096** bytes on the server ([`Connection::read_message`](src/network/server.cc)) and **8192** bytes on the client when receiving—large queries or wide results need protocol changes (framing / length prefix).
 
 ### QUERY execution flow
 
@@ -183,7 +183,7 @@ sequenceDiagram
   participant Database
   Client->>Connection: QUERY|sql newline
   Connection->>ThreadPool: submit handler
-  ThreadPool->>Database: executeQuery
+  ThreadPool->>Database: execute_query
   Database-->>ThreadPool: QueryResult
   ThreadPool->>Connection: formatQueryResult
   Connection->>Client: OK|... or ERROR|...
@@ -193,10 +193,10 @@ sequenceDiagram
 
 ## Persistence
 
-- Default directory: **`data/`** ([`Server`](include/network/Server.h) constructor argument).
-- On startup: [`Database::loadFromDisk`](src/core/Database.cpp) → [`PersistenceManager::loadDatabase`](include/storage/PersistenceManager.h).
-- After successful **INSERT**, **UPDATE**, **DELETE**, **CREATE TABLE**, all tables are saved ([`persistAfterMutation`](src/core/Database.cpp)).
-- File format: magic **`0x44425442`** (`"DBTB"`), version **1** ([`PersistenceManager`](include/storage/PersistenceManager.h)).
+- Default directory: **`data/`** ([`Server`](include/network/server.h) constructor argument).
+- On startup: [`Database::load_from_disk`](src/core/database.cc) → [`PersistenceManager::load_database`](include/storage/persistence_manager.h).
+- After successful **INSERT**, **UPDATE**, **DELETE**, **CREATE TABLE**, all tables are saved ([`persist_after_mutation`](src/core/database.cc)).
+- File format: magic **`0x44425442`** (`"DBTB"`), version **1** ([`PersistenceManager`](include/storage/persistence_manager.h)).
 
 ---
 
@@ -223,24 +223,24 @@ Comparisons, logical **AND** / **OR**, **NOT**, arithmetic `+ - * / %`, parenthe
 ### Layers
 
 1. **Client** — TCP connect, protocol lines, pretty-print (tabs shown as spaces).
-2. **Network** — `accept` thread; per-client read thread [`Connection`](src/network/Server.cpp); work submitted to **`ThreadPool`**; implementation waits for each task before reading the next message on the same socket.
-3. **Parser** — [`Lexer`](src/parser/Lexer.cpp) → [`Parser`](src/parser/Parser.cpp) → AST ([`AST.h`](include/parser/AST.h)).
-4. **Routing** — [`Database::executeQuery`](src/core/Database.cpp) dispatches by statement type to `executeSelectStatement`, `executeInsertStatement`, etc.
-5. **Execution** — [`QueryExecutor`](include/executor/QueryExecutor.h) classes: `SelectExecutor`, `InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateTableExecutor`.
-6. **Storage** — [`Table`](include/core/Table.h) / [`Row`](include/core/Row.h) / [`Column`](include/core/Column.h); serialization via `PersistenceManager`.
+2. **Network** — `accept` thread; per-client read thread [`Connection`](src/network/server.cc); work submitted to **`ThreadPool`**; implementation waits for each task before reading the next message on the same socket.
+3. **Parser** — [`Lexer`](src/parser/lexer.cc) → [`Parser`](src/parser/parser.cc) → AST ([`AST.h`](include/parser/ast.h)).
+4. **Routing** — [`Database::execute_query`](src/core/database.cc) dispatches by statement type to `execute_select_statement`, `execute_insert_statement`, etc.
+5. **Execution** — [`QueryExecutor`](include/executor/query_executor.h) classes: `SelectExecutor`, `InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateTableExecutor`.
+6. **Storage** — [`Table`](include/core/Table.h) / [`Row`](include/core/row.h) / [`Column`](include/core/column.h); serialization via `PersistenceManager`.
 
 ### Patterns (conservative wording)
 
 - **Strategy-like** split: separate executor classes sharing `QueryExecutor`.
-- **Singleton**: [`Logger`](include/utils/Logger.h) only (`Logger::getInstance()`).
+- **Singleton**: [`Logger`](include/utils/logger.h) only (`Logger::get_instance()`).
 - **`Database`** is **not** a singleton: one instance per **`Server`**, passed into connections by pointer.
-- Session teardown: `std::function` callback to unregister the connection ([`scheduleUnregisterConnection`](src/network/Server.cpp)).
+- Session teardown: `std::function` callback to unregister the connection ([`schedule_unregister_connection`](src/network/server.cc)).
 
 ---
 
 ## Concurrency and performance
 
-- All **`Database::executeQuery`** calls run under **`std::recursive_mutex`** ([`dbMutex`](include/core/Database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
+- All **`Database::execute_query`** calls run under **`std::recursive_mutex`** ([`db_mutex_`](include/core/Database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
 - **`ThreadPool`** is infrastructure for future work; the bottleneck today is one global lock for parse + execute.
 - Typical cost: full table scan **O(n)** rows for filtered SELECT/UPDATE/DELETE; no secondary indexes.
 
@@ -292,7 +292,7 @@ Do **not** rely on **JOIN**, **ORDER BY**, **GROUP BY**, or **SUM/AVG/MIN/MAX** 
 
 ## Logging and errors
 
-Macros from [`Logger.h`](include/utils/Logger.h):
+Macros from [`Logger.h`](include/utils/logger.h):
 
 ```cpp
 DB_LOG_DEBUG("...");
@@ -343,10 +343,10 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 
 ## Extending the codebase
 
-1. **New SQL statement** — extend [`Parser`](src/parser/Parser.cpp), add a `parseStatement` variant, handle it in `Database::executeQuery`.
-2. **New data type** — [`Value`](include/types/Value.h), [`DataType`](include/types/DataType.h), [`TypeConverter`](include/types/TypeConverter.h), checks in [`Table`](src/core/Table.cpp).
-3. **New constraint** — [`Column`](include/core/Column.h) + INSERT/UPDATE validation.
-4. **Richer SELECT** — extend [`SelectExecutor::execute`](src/executor/QueryExecutor.cpp); optionally factor JOIN/Sort/Aggregate operators.
+1. **New SQL statement** — extend [`Parser`](src/parser/parser.cc), add a `parse_statement` variant, handle it in `Database::execute_query`.
+2. **New data type** — [`Value`](include/types/value.h), [`DataType`](include/types/data_type.h), [`TypeConverter`](include/types/type_converter.h), checks in [`Table`](src/core/table.cc).
+3. **New constraint** — [`Column`](include/core/column.h) + INSERT/UPDATE validation.
+4. **Richer SELECT** — extend [`SelectExecutor::execute`](src/executor/query_executor.cc); optionally factor JOIN/Sort/Aggregate operators.
 
 Automated tests are **not** included in this repo; use the client and `make demo` for manual regression checks.
 
@@ -356,8 +356,8 @@ Automated tests are **not** included in this repo; use the client and `make demo
 
 | Metric | Value |
 |--------|-------|
-| Headers + sources under `include/` + `src/` | **34** files (`.h` / `.cpp`) |
-| Lines in main `.cpp` files + `main.cpp` | on the order of **~4800** (version-dependent) |
+| Headers + sources under `include/` + `src/` | **34** files (`.h` / `.cc`) |
+| Lines in main `.cc` files + `main.cc` | on the order of **~4800** (version-dependent) |
 | Major subsystems | network, parser, executor, storage, types, threading |
 
 ---

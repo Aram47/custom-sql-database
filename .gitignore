@@ -1,0 +1,12 @@
+# Build outputs
+/build/
+/bin/
+
+# Local database files
+/data/
+
+# OS / editor noise
+.DS_Store
+*.swp
+*.swo
+*~

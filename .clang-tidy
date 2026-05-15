@@ -1,0 +1,19 @@
+---
+Checks: >
+  -clang-analyzer-*,
+  -llvm-*,
+  -misc-*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  google-*,
+  -google-readability-todo,
+  -google-readability-avoid-underscore-in-googletest-name,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  readability-*,
+  -readability-identifier-length,
+  -readability-magic-numbers
+
+WarningsAsErrors: ''
+FormatStyle: file
