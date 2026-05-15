@@ -1,38 +1,13 @@
 #include "core/database.h"
 
-#include <atomic>
-#include <filesystem>
-
 #include "gtest/gtest.h"
+#include "tests/test_util.hh"
 
 namespace db {
 namespace {
 
-namespace fs = std::filesystem;
-
-class TempDbDir {
- public:
-  TempDbDir() {
-    static std::atomic<uint64_t> seq{0};
-    path_ = fs::temp_directory_path() /
-            ("custom_sql_db_test_" + std::to_string(++seq));
-    fs::create_directories(path_);
-  }
-
-  ~TempDbDir() {
-    std::error_code ec;
-    fs::remove_all(path_, ec);
-  }
-
-  const fs::path &path() const { return path_; }
-  std::string path_string() const { return path_.string(); }
-
- private:
-  fs::path path_;
-};
-
 TEST(DatabaseTest, CrudViaExecuteQuery) {
-  TempDbDir tmp;
+  test_util::TempDbDir tmp;
   Database db(tmp.path_string());
 
   auto created =
@@ -77,7 +52,7 @@ TEST(DatabaseTest, CrudViaExecuteQuery) {
 }
 
 TEST(DatabaseTest, PersistAndReload) {
-  TempDbDir tmp;
+  test_util::TempDbDir tmp;
   {
     Database db(tmp.path_string());
     ASSERT_TRUE(

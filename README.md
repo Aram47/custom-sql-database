@@ -10,6 +10,7 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 - [Stack and dependencies](#stack-and-dependencies)
 - [Project structure](#project-structure)
 - [Build](#build)
+- [Testing](#testing)
 - [Running](#running)
 - [Troubleshooting](#troubleshooting)
 - [Network protocol](#network-protocol)
@@ -35,7 +36,7 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 - **UPDATE** / **DELETE** — optional **WHERE** and expressions in `SET`.
 - **SELECT** — single table in **FROM**, column list or `*`, **WHERE**, expressions in the SELECT list (arithmetic, column references), **DISTINCT**.
 - Built-in scalar functions in SELECT expressions: **COUNT** (simplified semantics: returns `1` per row when an argument is present), **UPPER**, **LOWER**, **LENGTH**.
-- **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`DataType.h`](include/types/data_type.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
+- **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`data_type.h`](include/types/data_type.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
 - **Persistence**: directory of binary table files; successful mutations trigger a save.
 - **Network**: multi-client TCP server; **QUERY**, **PING**, **QUIT** commands.
 - **Client**: interactive mode and batch execution from a `.sql` file.
@@ -62,8 +63,9 @@ Treat the current **SELECT** as **single-table** with filtering and **DISTINCT**
 |-----------|---------|
 | Language | C++17 |
 | Build | [Makefile](Makefile), `g++` |
-| Platform | Linux / POSIX (`pthread`, Berkeley sockets) |
-| Dependencies | C++ standard library only—no third-party libraries |
+| Platform | POSIX (`pthread`, Berkeley sockets)—**Linux**, **macOS**, and similar; primary development target is POSIX desktops |
+| Dependencies (server & client) | C++ standard library only for `bin/db_server` and `bin/db_client` |
+| Dependencies (tests) | Optional: [GoogleTest](https://github.com/google/googletest) via git submodule [`third_party/googletest`](third_party/googletest)—run `git submodule update --init --recursive` before `make test` |
 
 Server entry point: [`main.cc`](main.cc). Port **9000** and thread-pool size **4** are hard-coded literals; change defaults by editing the `Server(...)` call in `main.cc` (or add CLI argument parsing).
 
@@ -72,7 +74,7 @@ Server entry point: [`main.cc`](main.cc). Port **9000** and thread-pool size **4
 ## Project structure
 
 ```
-lesson_47/
+custom-sql-database/   # repository root (rename locally if needed)
 ├── include/
 │   ├── core/          # Database, Table, Row, Column
 │   ├── parser/        # Lexer, Parser, AST, Token
@@ -83,8 +85,11 @@ lesson_47/
 │   ├── types/         # Value, DataType, TypeConverter
 │   └── utils/         # Logger, Exceptions
 ├── src/               # Implementations (.cc), mirrors include/
+├── tests/             # GoogleTest unit and integration tests
+├── third_party/
+│   └── googletest/    # git submodule (for `make test`)
 ├── client/
-│   └── cli_client.cc # TCP client
+│   └── cli_client.cc  # TCP client
 ├── data/              # Table files (created at runtime)
 ├── main.cc
 ├── Makefile
@@ -105,12 +110,46 @@ lesson_47/
 | `make run` | Build and run the server |
 | `make client-run` | Build and run the client (interactive) |
 | `make demo` | Server in background, runs temporary SQL from `build/demo_queries.sql`, then stops server |
+| `make tests` | Build test binary → `bin/run_tests` (requires initialized `third_party/googletest` submodule) |
+| `make test` | Build and run `bin/run_tests` |
 | `make clean` | Remove `build/` and `bin/` |
 | `make data-clean` | Remove `data/` |
 | `make distclean` | `clean` + `data-clean` |
 | `make help` | Short help for targets |
 
-Compiler flags: `-std=c++17 -Wall -Wextra -O2 -I.`, link with `-pthread`.
+Compiler flags: `-std=c++17 -Wall -Wextra -O2 -Iinclude`, link with `-pthread`. Test objects are built with extra include paths for GoogleTest ([Makefile](Makefile)).
+
+---
+
+## Testing
+
+One-time setup if the submodule is empty:
+
+```bash
+git submodule update --init --recursive
+```
+
+Then:
+
+```bash
+make test
+```
+
+This compiles and runs `bin/run_tests`, which links the full server object set with GoogleTest. Coverage is organized by file under [`tests/`](tests/):
+
+| Test source | Focus (high level) |
+|-------------|--------------------|
+| [`lexer_test.cc`](tests/lexer_test.cc) | Lexer tokens and edge cases |
+| [`parser_test.cc`](tests/parser_test.cc) | Parser ↔ SQL statements |
+| [`parser_ast_advanced_test.cc`](tests/parser_ast_advanced_test.cc) | Richer AST / parser scenarios |
+| [`value_test.cc`](tests/value_test.cc) | `Value` type behavior |
+| [`type_converter_test.cc`](tests/type_converter_test.cc) | Type conversion |
+| [`row_test.cc`](tests/row_test.cc) | Row layout and access |
+| [`database_test.cc`](tests/database_test.cc), [`database_extended_test.cc`](tests/database_extended_test.cc) | Database operations and persistence-oriented checks |
+| [`protocol_test.cc`](tests/protocol_test.cc) | Wire protocol formatting and parsing |
+| [`network_integration_test.cc`](tests/network_integration_test.cc) | TCP server + client-style exchange |
+
+Shared helpers live in [`tests/test_util.hh`](tests/test_util.hh).
 
 ---
 
@@ -154,7 +193,7 @@ Lines starting with `#` and empty lines are ignored. A statement is assembled un
 
 ## Network protocol
 
-Client messages are UTF-8 lines terminated by `\n`. Server-side parsing: [`Protocol::parseRequest`](include/network/Protocol.h).
+Client messages are UTF-8 lines terminated by `\n`. Server-side parsing: [`Protocol::parseRequest`](include/network/protocol.h).
 
 ### Requests
 
@@ -224,10 +263,10 @@ Comparisons, logical **AND** / **OR**, **NOT**, arithmetic `+ - * / %`, parenthe
 
 1. **Client** — TCP connect, protocol lines, pretty-print (tabs shown as spaces).
 2. **Network** — `accept` thread; per-client read thread [`Connection`](src/network/server.cc); work submitted to **`ThreadPool`**; implementation waits for each task before reading the next message on the same socket.
-3. **Parser** — [`Lexer`](src/parser/lexer.cc) → [`Parser`](src/parser/parser.cc) → AST ([`AST.h`](include/parser/ast.h)).
+3. **Parser** — [`Lexer`](src/parser/lexer.cc) → [`Parser`](src/parser/parser.cc) → AST ([`ast.h`](include/parser/ast.h)).
 4. **Routing** — [`Database::execute_query`](src/core/database.cc) dispatches by statement type to `execute_select_statement`, `execute_insert_statement`, etc.
 5. **Execution** — [`QueryExecutor`](include/executor/query_executor.h) classes: `SelectExecutor`, `InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateTableExecutor`.
-6. **Storage** — [`Table`](include/core/Table.h) / [`Row`](include/core/row.h) / [`Column`](include/core/column.h); serialization via `PersistenceManager`.
+6. **Storage** — [`Table`](include/core/table.h) / [`Row`](include/core/row.h) / [`Column`](include/core/column.h); serialization via `PersistenceManager`.
 
 ### Patterns (conservative wording)
 
@@ -240,7 +279,7 @@ Comparisons, logical **AND** / **OR**, **NOT**, arithmetic `+ - * / %`, parenthe
 
 ## Concurrency and performance
 
-- All **`Database::execute_query`** calls run under **`std::recursive_mutex`** ([`db_mutex_`](include/core/Database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
+- All **`Database::execute_query`** calls run under **`std::recursive_mutex`** ([`db_mutex_`](include/core/database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
 - **`ThreadPool`** is infrastructure for future work; the bottleneck today is one global lock for parse + execute.
 - Typical cost: full table scan **O(n)** rows for filtered SELECT/UPDATE/DELETE; no secondary indexes.
 
@@ -292,7 +331,7 @@ Do **not** rely on **JOIN**, **ORDER BY**, **GROUP BY**, or **SUM/AVG/MIN/MAX** 
 
 ## Logging and errors
 
-Macros from [`Logger.h`](include/utils/logger.h):
+Macros from [`logger.h`](include/utils/logger.h):
 
 ```cpp
 DB_LOG_DEBUG("...");
@@ -301,7 +340,7 @@ DB_LOG_WARNING("...");
 DB_LOG_ERROR("...");
 ```
 
-Exception hierarchy in [`Exceptions.h`](include/utils/Exceptions.h):
+Exception hierarchy in [`exceptions.h`](include/utils/exceptions.h):
 
 | Type | Purpose |
 |------|---------|
@@ -348,7 +387,7 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 3. **New constraint** — [`Column`](include/core/column.h) + INSERT/UPDATE validation.
 4. **Richer SELECT** — extend [`SelectExecutor::execute`](src/executor/query_executor.cc); optionally factor JOIN/Sort/Aggregate operators.
 
-Automated tests are **not** included in this repo; use the client and `make demo` for manual regression checks.
+For regression, run **`make test`** after pulling submodules; use the client and **`make demo`** for manual end-to-end checks.
 
 ---
 
@@ -357,7 +396,8 @@ Automated tests are **not** included in this repo; use the client and `make demo
 | Metric | Value |
 |--------|-------|
 | Headers + sources under `include/` + `src/` | **34** files (`.h` / `.cc`) |
-| Lines in main `.cc` files + `main.cc` | on the order of **~4800** (version-dependent) |
+| Lines in `src/**/*.cc` + `main.cc` | **~3700** (version-dependent) |
+| Test sources | **10** `tests/*.cc` + [`test_util.hh`](tests/test_util.hh); **~820** lines in test `.cc` files (approx.) |
 | Major subsystems | network, parser, executor, storage, types, threading |
 
 ---
@@ -373,4 +413,4 @@ Useful references:
 - POSIX socket programming.
 - Database textbooks (e.g. Silberschatz, Korth, Sudarshan—*Database System Concepts*).
 
-**Build:** `g++`, C++17, `-pthread`. **Target:** Linux/POSIX.
+**Build:** `g++`, C++17, `-Iinclude`, `-pthread`. **Target:** POSIX (Linux, macOS, and similar).

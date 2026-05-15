@@ -479,6 +479,12 @@ ExpressionPtr Parser::parse_primary_expression() {
     return expr;
   }
 
+  if (check(TokenType::COUNT) || check(TokenType::SUM) ||
+      check(TokenType::AVG) || check(TokenType::MIN) ||
+      check(TokenType::MAX)) {
+    return parse_identifier_or_function();
+  }
+
   if (check(TokenType::IDENTIFIER) || check(TokenType::ASTERISK)) {
     return parse_identifier_or_function();
   }

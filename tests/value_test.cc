@@ -51,5 +51,26 @@ TEST(ValueTest, FromStringBasicTypes) {
   EXPECT_TRUE(Value::from_string("true", DataType::BOOLEAN).as_bool());
 }
 
+TEST(ValueTest, OrderingMixedNumericAndCrossTypes) {
+  EXPECT_TRUE(Value(2) <= Value(2));
+  EXPECT_TRUE(Value(2) <= Value(3));
+  EXPECT_TRUE(Value(4) >= Value(3));
+  EXPECT_TRUE(Value(2.5) > Value(2));     // cross-type numeric compare path
+  EXPECT_TRUE(Value(1.9) < Value(int64_t{2}));
+
+  EXPECT_TRUE(Value(std::string("a")) < Value(std::string("b")));
+}
+
+TEST(ValueTest, SubtractionAndMultiplyInts) {
+  EXPECT_EQ((Value(10) - Value(4)).as_int(), 6);
+  EXPECT_EQ((Value(6) * Value(7)).as_int(), 42);
+}
+
+TEST(ValueTest, BoolCoercionFromStrings) {
+  EXPECT_FALSE(Value(std::string("0")).as_bool());
+  EXPECT_FALSE(Value(std::string("false")).as_bool());
+  EXPECT_TRUE(Value(std::string("yes")).as_bool());
+}
+
 }  // namespace
 }  // namespace db

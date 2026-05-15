@@ -47,5 +47,25 @@ TEST(LexerTest, LineCommentSkipped) {
   EXPECT_EQ(tokens[3].get_lexeme(), "t");
 }
 
+TEST(LexerTest, TypeAndDialectKeywords) {
+  Lexer lexer(
+      "FLOAT BOOLEAN DATE UUID VARCHAR INTEGER REAL TEXT BOOL INNER JOIN");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_GE(tokens.size(), 12u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::IDENTIFIER);
+  EXPECT_EQ(tokens[0].get_lexeme(), "FLOAT");
+  EXPECT_EQ(tokens[1].get_lexeme(), "BOOLEAN");
+  EXPECT_EQ(tokens[2].get_lexeme(), "DATE");
+  EXPECT_EQ(tokens[3].get_lexeme(), "UUID");
+  EXPECT_EQ(tokens[4].get_lexeme(), "VARCHAR");
+  EXPECT_EQ(tokens[5].get_lexeme(), "INTEGER");
+  EXPECT_EQ(tokens[6].get_lexeme(), "REAL");
+  EXPECT_EQ(tokens[7].get_lexeme(), "TEXT");
+  EXPECT_EQ(tokens[8].get_lexeme(), "BOOL");
+  EXPECT_EQ(tokens[9].get_type(), TokenType::INNER);
+  EXPECT_EQ(tokens[10].get_type(), TokenType::JOIN);
+  EXPECT_EQ(tokens[11].get_type(), TokenType::END_OF_INPUT);
+}
+
 }  // namespace
 }  // namespace db

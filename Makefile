@@ -28,7 +28,7 @@ GTEST_MAIN_CC := $(GTEST_ROOT)/src/gtest_main.cc
 GTEST_CPPFLAGS := -isystem $(GTEST_ROOT)/include -I$(GTEST_ROOT)
 GTEST_OBJECTS := $(BUILD_DIR)/third_party/gtest-all.o $(BUILD_DIR)/third_party/gtest_main.o
 
-TEST_CPPFLAGS := -isystem $(GTEST_ROOT)/include
+TEST_CPPFLAGS := -isystem $(GTEST_ROOT)/include -I.
 
 TEST_DIR := tests
 TEST_SOURCES := $(wildcard $(TEST_DIR)/*.cc)
