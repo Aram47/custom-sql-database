@@ -49,6 +49,12 @@ std::string Token::token_type_to_string(TokenType type) {
       return "LEFT";
     case TokenType::RIGHT:
       return "RIGHT";
+    case TokenType::FULL:
+      return "FULL";
+    case TokenType::OUTER:
+      return "OUTER";
+    case TokenType::CROSS:
+      return "CROSS";
     case TokenType::ON:
       return "ON";
     case TokenType::GROUP:

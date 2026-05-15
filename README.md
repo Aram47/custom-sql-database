@@ -33,23 +33,22 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 
 - **CREATE TABLE** — schema with types and `PRIMARY KEY`, `UNIQUE`, `NOT NULL` constraints.
 - **INSERT** — one or many rows; explicit column list or table column order.
-- **UPDATE** / **DELETE** — optional **WHERE** and expressions in `SET`.
-- **SELECT** — single table in **FROM**, column list or `*`, **WHERE**, expressions in the SELECT list (arithmetic, column references), **DISTINCT**.
+- **UPDATE** / **DELETE** — optional **WHERE**. **`UPDATE` `SET`** accepts only literals and column references on the right-hand side (no arithmetic).
+- **SELECT** — column list or `*`, optional **WHERE**, expressions in the SELECT list (arithmetic, qualified or unambiguous column references), **DISTINCT**. **FROM** may name a single table **or** chain several tables with **JOIN**: **INNER** (including bare `JOIN`), **LEFT** / **RIGHT** / **FULL** with optional **OUTER**, and **CROSS**. **ON** is required for **LEFT**, **RIGHT**, and **FULL**; optional for **INNER** (without **ON**, the join is a Cartesian product); forbidden for **CROSS** (parse error if **ON** is present). With multiple tables, [`JoinSelectExecutor`](src/executor/join_select_executor.cc) runs nested-loop joins; `SELECT *` emits **qualified** headers (`alias.column`). Bare column names must be unique across participating tables or execution reports an ambiguity error. Single-table queries still use [`SelectExecutor`](src/executor/query_executor.cc). Expression evaluation shared via [`SelectExpressionEvaluator`](include/executor/select_expression_evaluator.h).
 - Built-in scalar functions in SELECT expressions: **COUNT** (simplified semantics: returns `1` per row when an argument is present), **UPPER**, **LOWER**, **LENGTH**.
 - **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`data_type.h`](include/types/data_type.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
 - **Persistence**: directory of binary table files; successful mutations trigger a save.
 - **Network**: multi-client TCP server; **QUERY**, **PING**, **QUIT** commands.
 - **Client**: interactive mode and batch execution from a `.sql` file.
 
-### Parsed by the lexer/parser but not applied by the SELECT executor
+### Parsed by the lexer/parser but not applied by SELECT / JOIN execution
 
-These constructs are represented in the AST ([`SelectStatement`](include/parser/ast.h)), but [`SelectExecutor`](src/executor/query_executor.cc) does **not** apply them to the result:
+These clauses are parsed into [`SelectStatement`](include/parser/ast.h) but **[`JoinSelectExecutor`](src/executor/join_select_executor.cc)** and **[`SelectExecutor`](src/executor/query_executor.cc)** ignore them until implemented:
 
-- **JOIN** (`INNER` / `LEFT` / `RIGHT`, and bare `JOIN` treated as inner join at parse time).
 - **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET**.
-- Full **SUM**, **AVG**, **MIN**, **MAX** aggregates (tokens exist in the lexer; the SELECT executor has no grouping logic for them).
+- Full **SUM**, **AVG**, **MIN**, **MAX** aggregates with grouping (tokens exist in the lexer; there is no grouping engine yet).
 
-Treat the current **SELECT** as **single-table** with filtering and **DISTINCT**.
+**UPDATE** `SET` still evaluates only **literals** and **column references** on the right-hand side (no arithmetic in `SET`), via [`SelectExpressionEvaluator::evaluate_dml_assignment_rhs`](include/executor/select_expression_evaluator.h).
 
 ### C++ API only, not SQL
 
@@ -139,13 +138,14 @@ This compiles and runs `bin/run_tests`, which links the full server object set w
 
 | Test source | Focus (high level) |
 |-------------|--------------------|
-| [`lexer_test.cc`](tests/lexer_test.cc) | Lexer tokens and edge cases |
+| [`lexer_test.cc`](tests/lexer_test.cc) | Lexer tokens and edge cases; join keywords **FULL**, **OUTER**, **CROSS** |
 | [`parser_test.cc`](tests/parser_test.cc) | Parser ↔ SQL statements |
-| [`parser_ast_advanced_test.cc`](tests/parser_ast_advanced_test.cc) | Richer AST / parser scenarios |
+| [`parser_ast_advanced_test.cc`](tests/parser_ast_advanced_test.cc) | Richer AST / parser scenarios; **CROSS** / **FULL OUTER** / **LEFT OUTER** join parsing |
 | [`value_test.cc`](tests/value_test.cc) | `Value` type behavior |
 | [`type_converter_test.cc`](tests/type_converter_test.cc) | Type conversion |
 | [`row_test.cc`](tests/row_test.cc) | Row layout and access |
 | [`database_test.cc`](tests/database_test.cc), [`database_extended_test.cc`](tests/database_extended_test.cc) | Database operations and persistence-oriented checks |
+| [`select_join_test.cc`](tests/select_join_test.cc) | INNER / LEFT / RIGHT / FULL OUTER / CROSS joins, cartesian INNER without **ON**, chaining, parse errors, ambiguity, wildcard headers |
 | [`protocol_test.cc`](tests/protocol_test.cc) | Wire protocol formatting and parsing |
 | [`network_integration_test.cc`](tests/network_integration_test.cc) | TCP server + client-style exchange |
 
@@ -248,7 +248,7 @@ sequenceDiagram
 ### DML
 
 - **`INSERT INTO`** — `VALUES` for one or more rows.
-- **`SELECT`** — see [Features](#features): single table, **WHERE**, **DISTINCT**, expressions and the listed functions.
+- **`SELECT`** — see [Features](#features): single table or **JOIN** chains (**INNER**, **LEFT**, **RIGHT**, **FULL**, **CROSS**), **WHERE**, **DISTINCT**, expressions and the listed functions where supported.
 - **`UPDATE`** / **`DELETE`** — optional **WHERE**.
 
 ### Expressions in WHERE and SELECT
@@ -265,7 +265,7 @@ Comparisons, logical **AND** / **OR**, **NOT**, arithmetic `+ - * / %`, parenthe
 2. **Network** — `accept` thread; per-client read thread [`Connection`](src/network/server.cc); work submitted to **`ThreadPool`**; implementation waits for each task before reading the next message on the same socket.
 3. **Parser** — [`Lexer`](src/parser/lexer.cc) → [`Parser`](src/parser/parser.cc) → AST ([`ast.h`](include/parser/ast.h)).
 4. **Routing** — [`Database::execute_query`](src/core/database.cc) dispatches by statement type to `execute_select_statement`, `execute_insert_statement`, etc.
-5. **Execution** — [`QueryExecutor`](include/executor/query_executor.h) classes: `SelectExecutor`, `InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateTableExecutor`.
+5. **Execution** — [`QueryExecutor`](include/executor/query_executor.h) classes: `SelectExecutor`, `JoinSelectExecutor`, `InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateTableExecutor`; shared [`SelectExpressionEvaluator`](include/executor/select_expression_evaluator.h) for row/column binding in SELECT and DML predicates.
 6. **Storage** — [`Table`](include/core/table.h) / [`Row`](include/core/row.h) / [`Column`](include/core/column.h); serialization via `PersistenceManager`.
 
 ### Patterns (conservative wording)
@@ -281,7 +281,7 @@ Comparisons, logical **AND** / **OR**, **NOT**, arithmetic `+ - * / %`, parenthe
 
 - All **`Database::execute_query`** calls run under **`std::recursive_mutex`** ([`db_mutex_`](include/core/database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
 - **`ThreadPool`** is infrastructure for future work; the bottleneck today is one global lock for parse + execute.
-- Typical cost: full table scan **O(n)** rows for filtered SELECT/UPDATE/DELETE; no secondary indexes.
+- Typical cost: full table scan **O(n)** rows for filtered single-table work; each **JOIN** adds a nested loop over the right-hand table (**O(n·m·…)** with no indexes). No secondary indexes.
 
 See [Limitations and future work](#limitations-and-future-work) for more.
 
@@ -317,6 +317,27 @@ SELECT DISTINCT age FROM users;
 SELECT name FROM users WHERE active = true AND age >= 30;
 ```
 
+### Joins
+
+```sql
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT NOT NULL);
+CREATE TABLE customers (id INT PRIMARY KEY, name STRING NOT NULL);
+INSERT INTO orders VALUES (1, 10);
+INSERT INTO customers VALUES (10, 'Carol');
+
+SELECT orders.id, customers.name
+FROM orders
+INNER JOIN customers ON orders.user_id = customers.id;
+
+-- Cartesian product (INNER without ON, or CROSS)
+SELECT a.i, b.j FROM a INNER JOIN b;
+SELECT a.i, b.j FROM a CROSS JOIN b;
+
+-- FULL OUTER (unmatched rows from either side appear with NULLs)
+SELECT fa.id, fb.id
+FROM fa FULL OUTER JOIN fb ON fa.id = fb.id;
+```
+
 ### Update and delete
 
 ```sql
@@ -325,7 +346,7 @@ UPDATE users SET age = 31 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 ```
 
-Do **not** rely on **JOIN**, **ORDER BY**, **GROUP BY**, or **SUM/AVG/MIN/MAX** until implemented in `SelectExecutor`.
+Do **not** rely on **ORDER BY**, **GROUP BY**, **HAVING**, **LIMIT**, **OFFSET**, or **SUM/AVG/MIN/MAX** with grouping until implemented. **`SELECT`** with **JOIN** is supported as described under [Features](#features). There is still no **`table.\*`** qualifier (only `*` or qualified column names; multi-table `SELECT *` uses `alias.column` headers).
 
 ---
 
@@ -363,7 +384,7 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 - No **transactions** or ACID isolation.
 - No **indexes**—full scans only.
 - No **query optimizer**.
-- **JOIN**, **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET** appear in the AST; the SELECT executor ignores them.
+- **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET** appear in the AST but are not executed.
 - No SQL **`DROP TABLE`** (programmatic API only).
 - No subqueries, views, or declarative foreign keys.
 - No authentication or authorization.
@@ -371,7 +392,7 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 
 ### Possible enhancements
 
-1. Implement joins and aggregation in `SelectExecutor` (or separate relational operators).
+1. Implement aggregation, sort, and limit/offset as relational operators (possibly split out of `SelectExecutor` / `JoinSelectExecutor`).
 2. B-tree or hash indexes for point lookups.
 3. Transactions and write-ahead logging (WAL).
 4. Connection pooling and framed/streaming protocol for large payloads.
@@ -385,7 +406,7 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 1. **New SQL statement** — extend [`Parser`](src/parser/parser.cc), add a `parse_statement` variant, handle it in `Database::execute_query`.
 2. **New data type** — [`Value`](include/types/value.h), [`DataType`](include/types/data_type.h), [`TypeConverter`](include/types/type_converter.h), checks in [`Table`](src/core/table.cc).
 3. **New constraint** — [`Column`](include/core/column.h) + INSERT/UPDATE validation.
-4. **Richer SELECT** — extend [`SelectExecutor::execute`](src/executor/query_executor.cc); optionally factor JOIN/Sort/Aggregate operators.
+4. **Richer SELECT** — extend [`JoinSelectExecutor`](src/executor/join_select_executor.cc) / [`SelectExecutor`](src/executor/query_executor.cc); factor sort, aggregate, and limit operators as needed.
 
 For regression, run **`make test`** after pulling submodules; use the client and **`make demo`** for manual end-to-end checks.
 
@@ -395,9 +416,9 @@ For regression, run **`make test`** after pulling submodules; use the client and
 
 | Metric | Value |
 |--------|-------|
-| Headers + sources under `include/` + `src/` | **34** files (`.h` / `.cc`) |
-| Lines in `src/**/*.cc` + `main.cc` | **~3700** (version-dependent) |
-| Test sources | **10** `tests/*.cc` + [`test_util.hh`](tests/test_util.hh); **~820** lines in test `.cc` files (approx.) |
+| Headers + sources under `include/` + `src/` | **~38** files (`.h` / `.cc`) |
+| Lines in `src/**/*.cc` + `main.cc` | **~4000** (version-dependent) |
+| Test sources | **11** `tests/*.cc` + [`test_util.hh`](tests/test_util.hh); **~950** lines in test `.cc` files (approx.) |
 | Major subsystems | network, parser, executor, storage, types, threading |
 
 ---

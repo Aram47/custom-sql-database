@@ -270,7 +270,13 @@ std::string SelectStatement::to_string() const {
   }
 
   for (const auto &[type, tname, alias, condition] : joins_) {
-    oss << " " << type << " JOIN " << tname;
+    if (type == "CROSS") {
+      oss << " CROSS JOIN " << tname;
+    } else if (type == "FULL") {
+      oss << " FULL JOIN " << tname;
+    } else {
+      oss << " " << type << " JOIN " << tname;
+    }
     if (alias != tname) oss << " " << alias;
     if (condition) oss << " ON " << condition->to_string();
   }

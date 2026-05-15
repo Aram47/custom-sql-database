@@ -53,13 +53,6 @@ class SelectExecutor : public QueryExecutor {
  private:
   std::shared_ptr<SelectStatement> stmt_;
   Table *table_;
-
-  bool evaluate_condition(const Row &row,
-                          const std::vector<std::string> &col_names,
-                          const ExpressionPtr &condition) const;
-  Value evaluate_expression(const Row &row,
-                            const std::vector<std::string> &col_names,
-                            const ExpressionPtr &expr) const;
 };
 
 // INSERT executor
@@ -82,13 +75,6 @@ class UpdateExecutor : public QueryExecutor {
  private:
   std::shared_ptr<UpdateStatement> stmt_;
   Table *table_;
-
-  bool evaluate_condition(const Row &row,
-                          const std::vector<std::string> &col_names,
-                          const ExpressionPtr &condition) const;
-  Value evaluate_expression(const Row &row,
-                            const std::vector<std::string> &col_names,
-                            const ExpressionPtr &expr) const;
 };
 
 // DELETE executor
@@ -100,13 +86,6 @@ class DeleteExecutor : public QueryExecutor {
  private:
   std::shared_ptr<DeleteStatement> stmt_;
   Table *table_;
-
-  bool evaluate_condition(const Row &row,
-                          const std::vector<std::string> &col_names,
-                          const ExpressionPtr &condition) const;
-  Value evaluate_expression(const Row &row,
-                            const std::vector<std::string> &col_names,
-                            const ExpressionPtr &expr) const;
 };
 
 // CREATE TABLE executor

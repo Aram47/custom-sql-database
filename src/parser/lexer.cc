@@ -313,6 +313,9 @@ TokenType Lexer::get_keyword_token_type(const std::string &keyword) const {
   if (upper == "INNER") return TokenType::INNER;
   if (upper == "LEFT") return TokenType::LEFT;
   if (upper == "RIGHT") return TokenType::RIGHT;
+  if (upper == "FULL") return TokenType::FULL;
+  if (upper == "OUTER") return TokenType::OUTER;
+  if (upper == "CROSS") return TokenType::CROSS;
   if (upper == "ON") return TokenType::ON;
   if (upper == "GROUP") return TokenType::GROUP;
   if (upper == "BY") return TokenType::BY;

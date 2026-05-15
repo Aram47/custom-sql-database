@@ -4,10 +4,29 @@
 #include <cmath>
 #include <numeric>
 
+#include "executor/select_expression_evaluator.h"
 #include "types/type_converter.h"
 
 namespace db {
 
+namespace {
+
+SelectExpressionEvaluator evaluator_for_table(
+    Table *table, const std::string &alias_for_refs) {
+  std::vector<SelectColumnBinding> bind;
+  bind.reserve(table->get_column_count());
+  const std::string phys = table->get_name();
+  for (const auto &col : table->get_columns()) {
+    bind.push_back({alias_for_refs, phys, col.get_name()});
+  }
+  return SelectExpressionEvaluator(std::move(bind));
+}
+
+SelectExpressionEvaluator evaluator_for_dml_table(Table *table) {
+  return evaluator_for_table(table, table->get_name());
+}
+
+}  // namespace
 // ==================== SelectExecutor ====================
 
 SelectExecutor::SelectExecutor(std::shared_ptr<SelectStatement> stmt,
@@ -23,16 +42,15 @@ QueryResult SelectExecutor::execute() {
   }
 
   std::vector<Row> all_rows = table_->get_all_rows();
-  std::vector<std::string> col_names;
-  for (const auto &col : table_->get_columns()) {
-    col_names.push_back(col.get_name());
-  }
+
+  SelectExpressionEvaluator eval =
+      evaluator_for_table(table_, stmt_->get_from_alias());
 
   // Filter rows by WHERE clause
   std::vector<Row> filtered_rows;
   for (const auto &row : all_rows) {
     if (!stmt_->get_where_condition() ||
-        evaluate_condition(row, col_names, stmt_->get_where_condition())) {
+        eval.evaluate_condition(row, stmt_->get_where_condition())) {
       filtered_rows.push_back(row);
     }
   }
@@ -73,7 +91,7 @@ QueryResult SelectExecutor::execute() {
           resultRow.push_back(row.get_value(i));
         }
       } else {
-        resultRow.push_back(evaluate_expression(row, col_names, expr));
+        resultRow.push_back(eval.evaluate_expression(row, expr, nullptr));
       }
     }
 
@@ -108,124 +126,6 @@ QueryResult SelectExecutor::execute() {
   result.message = "SELECT OK";
 
   return result;
-}
-
-bool SelectExecutor::evaluate_condition(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &condition) const {
-  if (!condition) return true;
-
-  auto bin_op = std::dynamic_pointer_cast<BinaryOpExpression>(condition);
-  if (bin_op) {
-    Value left = evaluate_expression(row, col_names, bin_op->get_left());
-    Value right = evaluate_expression(row, col_names, bin_op->get_right());
-
-    switch (bin_op->get_operator()) {
-      case BinaryOpExpression::Operator::EQ:
-        return left == right;
-      case BinaryOpExpression::Operator::NE:
-        return left != right;
-      case BinaryOpExpression::Operator::LT:
-        return left < right;
-      case BinaryOpExpression::Operator::LE:
-        return left <= right;
-      case BinaryOpExpression::Operator::GT:
-        return left > right;
-      case BinaryOpExpression::Operator::GE:
-        return left >= right;
-      case BinaryOpExpression::Operator::AND:
-        return evaluate_condition(row, col_names, bin_op->get_left()) &&
-               evaluate_condition(row, col_names, bin_op->get_right());
-      case BinaryOpExpression::Operator::OR:
-        return evaluate_condition(row, col_names, bin_op->get_left()) ||
-               evaluate_condition(row, col_names, bin_op->get_right());
-      default:
-        return true;
-    }
-  }
-
-  auto unaryOp = std::dynamic_pointer_cast<UnaryOpExpression>(condition);
-  if (unaryOp) {
-    if (unaryOp->get_operator() == UnaryOpExpression::Operator::NOT) {
-      return !evaluate_condition(row, col_names, unaryOp->get_expression());
-    }
-  }
-
-  return true;
-}
-
-Value SelectExecutor::evaluate_expression(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &expr) const {
-  auto literal = std::dynamic_pointer_cast<LiteralExpression>(expr);
-  if (literal) return literal->get_value();
-
-  auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(expr);
-  if (col_ref) {
-    int idx = -1;
-    for (size_t i = 0; i < col_names.size(); ++i) {
-      if (col_names[i] == col_ref->get_column()) {
-        idx = i;
-        break;
-      }
-    }
-    if (idx >= 0 && idx < (int)row.get_column_count()) {
-      return row.get_value(idx);
-    }
-    return Value();
-  }
-
-  auto bin_op = std::dynamic_pointer_cast<BinaryOpExpression>(expr);
-  if (bin_op) {
-    Value left = evaluate_expression(row, col_names, bin_op->get_left());
-    Value right = evaluate_expression(row, col_names, bin_op->get_right());
-
-    switch (bin_op->get_operator()) {
-      case BinaryOpExpression::Operator::PLUS:
-        return left + right;
-      case BinaryOpExpression::Operator::MINUS:
-        return left - right;
-      case BinaryOpExpression::Operator::MUL:
-        return left * right;
-      case BinaryOpExpression::Operator::DIV:
-        return left / right;
-      case BinaryOpExpression::Operator::MOD: {
-        if (left.is_int() && right.is_int()) {
-          return Value(left.as_int() % right.as_int());
-        }
-        return Value();
-      }
-      default:
-        return Value();
-    }
-  }
-
-  auto func = std::dynamic_pointer_cast<FunctionCallExpression>(expr);
-  if (func) {
-    auto func_name = func->get_function_name();
-    std::transform(func_name.begin(), func_name.end(), func_name.begin(),
-                   ::tolower);
-
-    const auto &args = func->get_arguments();
-    if (func_name == "count" && !args.empty()) {
-      return Value((int64_t)1);  // Simplified count (used in SELECT context)
-    } else if (func_name == "upper" && !args.empty()) {
-      Value val = evaluate_expression(row, col_names, args[0]);
-      std::string str = val.as_string();
-      std::transform(str.begin(), str.end(), str.begin(), ::toupper);
-      return Value(str);
-    } else if (func_name == "lower" && !args.empty()) {
-      Value val = evaluate_expression(row, col_names, args[0]);
-      std::string str = val.as_string();
-      std::transform(str.begin(), str.end(), str.begin(), ::tolower);
-      return Value(str);
-    } else if (func_name == "length" && !args.empty()) {
-      Value val = evaluate_expression(row, col_names, args[0]);
-      return Value((int64_t)val.as_string().length());
-    }
-  }
-
-  return Value();
 }
 
 // ==================== InsertExecutor ====================
@@ -291,23 +191,21 @@ QueryResult UpdateExecutor::execute() {
     return QueryResult::error_result("Table not found");
   }
 
-  std::vector<std::string> col_names;
-  for (const auto &col : table_->get_columns()) {
-    col_names.push_back(col.get_name());
-  }
+  SelectExpressionEvaluator eval = evaluator_for_dml_table(table_);
 
   int updated_count = 0;
   std::vector<Row> &rows = table_->get_mutable_rows();
 
   for (size_t i = 0; i < rows.size(); ++i) {
     if (!stmt_->get_where_condition() ||
-        evaluate_condition(rows[i], col_names, stmt_->get_where_condition())) {
+        eval.evaluate_condition(rows[i], stmt_->get_where_condition())) {
       Row newRow = rows[i];
 
       for (const auto &[colName, expr] : stmt_->get_set_clauses()) {
         int colIdx = table_->get_column_index(colName);
         if (colIdx >= 0) {
-          Value newValue = evaluate_expression(rows[i], col_names, expr);
+          Value newValue =
+              eval.evaluate_dml_assignment_rhs(rows[i], expr);
           newRow.set_value(colIdx, newValue);
         }
       }
@@ -327,67 +225,6 @@ QueryResult UpdateExecutor::execute() {
   return result;
 }
 
-bool UpdateExecutor::evaluate_condition(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &condition) const {
-  if (!condition) return true;
-
-  auto bin_op = std::dynamic_pointer_cast<BinaryOpExpression>(condition);
-  if (bin_op) {
-    Value left = evaluate_expression(row, col_names, bin_op->get_left());
-    Value right = evaluate_expression(row, col_names, bin_op->get_right());
-
-    switch (bin_op->get_operator()) {
-      case BinaryOpExpression::Operator::EQ:
-        return left == right;
-      case BinaryOpExpression::Operator::NE:
-        return left != right;
-      case BinaryOpExpression::Operator::LT:
-        return left < right;
-      case BinaryOpExpression::Operator::LE:
-        return left <= right;
-      case BinaryOpExpression::Operator::GT:
-        return left > right;
-      case BinaryOpExpression::Operator::GE:
-        return left >= right;
-      case BinaryOpExpression::Operator::AND:
-        return evaluate_condition(row, col_names, bin_op->get_left()) &&
-               evaluate_condition(row, col_names, bin_op->get_right());
-      case BinaryOpExpression::Operator::OR:
-        return evaluate_condition(row, col_names, bin_op->get_left()) ||
-               evaluate_condition(row, col_names, bin_op->get_right());
-      default:
-        return true;
-    }
-  }
-
-  return true;
-}
-
-Value UpdateExecutor::evaluate_expression(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &expr) const {
-  auto literal = std::dynamic_pointer_cast<LiteralExpression>(expr);
-  if (literal) return literal->get_value();
-
-  auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(expr);
-  if (col_ref) {
-    int idx = -1;
-    for (size_t i = 0; i < col_names.size(); ++i) {
-      if (col_names[i] == col_ref->get_column()) {
-        idx = i;
-        break;
-      }
-    }
-    if (idx >= 0 && idx < (int)row.get_column_count()) {
-      return row.get_value(idx);
-    }
-    return Value();
-  }
-
-  return Value();
-}
-
 // ==================== DeleteExecutor ====================
 
 DeleteExecutor::DeleteExecutor(std::shared_ptr<DeleteStatement> stmt,
@@ -399,19 +236,17 @@ QueryResult DeleteExecutor::execute() {
     return QueryResult::error_result("Table not found");
   }
 
-  std::vector<std::string> col_names;
-  for (const auto &col : table_->get_columns()) {
-    col_names.push_back(col.get_name());
-  }
+  SelectExpressionEvaluator eval = evaluator_for_dml_table(table_);
 
   int deleted_count = 0;
   const std::vector<Row> &rows = table_->get_all_rows();
 
   // Collect indices to delete (in reverse order to avoid index shifting)
   std::vector<int> indicesToDelete;
-  for (int i = rows.size() - 1; i >= 0; --i) {
+  for (int i = static_cast<int>(rows.size()) - 1; i >= 0; --i) {
     if (!stmt_->get_where_condition() ||
-        evaluate_condition(rows[i], col_names, stmt_->get_where_condition())) {
+        eval.evaluate_condition(rows[static_cast<size_t>(i)],
+                                stmt_->get_where_condition())) {
       indicesToDelete.push_back(i);
     }
   }
@@ -430,67 +265,6 @@ QueryResult DeleteExecutor::execute() {
   QueryResult result = QueryResult::success_result("DELETE OK");
   result.affected_rows = deleted_count;
   return result;
-}
-
-bool DeleteExecutor::evaluate_condition(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &condition) const {
-  if (!condition) return true;
-
-  auto bin_op = std::dynamic_pointer_cast<BinaryOpExpression>(condition);
-  if (bin_op) {
-    Value left = evaluate_expression(row, col_names, bin_op->get_left());
-    Value right = evaluate_expression(row, col_names, bin_op->get_right());
-
-    switch (bin_op->get_operator()) {
-      case BinaryOpExpression::Operator::EQ:
-        return left == right;
-      case BinaryOpExpression::Operator::NE:
-        return left != right;
-      case BinaryOpExpression::Operator::LT:
-        return left < right;
-      case BinaryOpExpression::Operator::LE:
-        return left <= right;
-      case BinaryOpExpression::Operator::GT:
-        return left > right;
-      case BinaryOpExpression::Operator::GE:
-        return left >= right;
-      case BinaryOpExpression::Operator::AND:
-        return evaluate_condition(row, col_names, bin_op->get_left()) &&
-               evaluate_condition(row, col_names, bin_op->get_right());
-      case BinaryOpExpression::Operator::OR:
-        return evaluate_condition(row, col_names, bin_op->get_left()) ||
-               evaluate_condition(row, col_names, bin_op->get_right());
-      default:
-        return true;
-    }
-  }
-
-  return true;
-}
-
-Value DeleteExecutor::evaluate_expression(
-    const Row &row, const std::vector<std::string> &col_names,
-    const ExpressionPtr &expr) const {
-  auto literal = std::dynamic_pointer_cast<LiteralExpression>(expr);
-  if (literal) return literal->get_value();
-
-  auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(expr);
-  if (col_ref) {
-    int idx = -1;
-    for (size_t i = 0; i < col_names.size(); ++i) {
-      if (col_names[i] == col_ref->get_column()) {
-        idx = i;
-        break;
-      }
-    }
-    if (idx >= 0 && idx < (int)row.get_column_count()) {
-      return row.get_value(idx);
-    }
-    return Value();
-  }
-
-  return Value();
 }
 
 // ==================== CreateTableExecutor ====================

@@ -1,5 +1,6 @@
 #include "core/database.h"
 
+#include "executor/join_select_executor.h"
 #include "executor/query_executor.h"
 #include "parser/parser.h"
 #include "storage/persistence_manager.h"
@@ -128,13 +129,18 @@ QueryResult Database::execute_select_statement(
     return QueryResult::error_result("SELECT requires FROM clause");
   }
 
-  Table *table = get_table(stmt->get_from_table());
-  if (!table) {
+  Table *base = get_table(stmt->get_from_table());
+  if (!base) {
     return QueryResult::error_result("Table '" + stmt->get_from_table() +
                                      "' not found");
   }
 
-  SelectExecutor executor(stmt, table);
+  if (!stmt->get_joins().empty()) {
+    JoinSelectExecutor executor(stmt, this);
+    return executor.execute();
+  }
+
+  SelectExecutor executor(stmt, base);
   return executor.execute();
 }
 

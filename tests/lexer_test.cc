@@ -67,5 +67,15 @@ TEST(LexerTest, TypeAndDialectKeywords) {
   EXPECT_EQ(tokens[11].get_type(), TokenType::END_OF_INPUT);
 }
 
+TEST(LexerTest, FullOuterCrossKeywords) {
+  Lexer lexer("FULL OUTER CROSS");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_GE(tokens.size(), 4u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::FULL);
+  EXPECT_EQ(tokens[1].get_type(), TokenType::OUTER);
+  EXPECT_EQ(tokens[2].get_type(), TokenType::CROSS);
+  EXPECT_EQ(tokens[3].get_type(), TokenType::END_OF_INPUT);
+}
+
 }  // namespace
 }  // namespace db

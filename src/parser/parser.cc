@@ -112,18 +112,32 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
 
     // Parse JOINs
     while (check(TokenType::INNER) || check(TokenType::LEFT) ||
-           check(TokenType::RIGHT) || check(TokenType::JOIN)) {
+           check(TokenType::RIGHT) || check(TokenType::JOIN) ||
+           check(TokenType::FULL) || check(TokenType::CROSS)) {
       std::string joinType;
-      if (match(TokenType::INNER)) {
-        joinType = "INNER";
-      } else if (match(TokenType::LEFT)) {
-        joinType = "LEFT";
-      } else if (match(TokenType::RIGHT)) {
-        joinType = "RIGHT";
+      ExpressionPtr condition;
+
+      if (match(TokenType::CROSS)) {
+        consume(TokenType::JOIN, "Expected JOIN");
+        joinType = "CROSS";
+      } else if (match(TokenType::FULL)) {
+        match(TokenType::OUTER);
+        consume(TokenType::JOIN, "Expected JOIN");
+        joinType = "FULL";
       } else {
-        joinType = "INNER";
+        if (match(TokenType::INNER)) {
+          joinType = "INNER";
+        } else if (match(TokenType::LEFT)) {
+          joinType = "LEFT";
+          match(TokenType::OUTER);
+        } else if (match(TokenType::RIGHT)) {
+          joinType = "RIGHT";
+          match(TokenType::OUTER);
+        } else {
+          joinType = "INNER";
+        }
+        consume(TokenType::JOIN, "Expected JOIN");
       }
-      consume(TokenType::JOIN, "Expected JOIN");
 
       std::string joinTable =
           consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
@@ -133,9 +147,18 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
             consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
       }
 
-      ExpressionPtr condition;
-      if (match(TokenType::ON)) {
+      if (joinType == "CROSS") {
+        if (match(TokenType::ON)) {
+          throw ParseException(
+              get_error_message("CROSS JOIN cannot have ON clause"));
+        }
+      } else if (joinType == "FULL") {
+        consume(TokenType::ON, "Expected ON clause for FULL JOIN");
         condition = parse_expression();
+      } else {
+        if (match(TokenType::ON)) {
+          condition = parse_expression();
+        }
       }
 
       stmt->add_join(joinType, joinTable, joinAlias, condition);

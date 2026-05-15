@@ -4,6 +4,7 @@
 
 #include "gtest/gtest.h"
 #include "parser/ast.h"
+#include "utils/exceptions.h"
 
 namespace db {
 namespace {
@@ -31,6 +32,47 @@ TEST(ParserAstAdvancedTest, InnerJoinParsed) {
   EXPECT_EQ(std::get<0>(joins[0]), "INNER");
   EXPECT_EQ(std::get<1>(joins[0]), "customers");
   EXPECT_NE(std::get<3>(joins[0]), nullptr);
+}
+
+TEST(ParserAstAdvancedTest, CrossJoinParsed) {
+  Parser parser("SELECT * FROM x CROSS JOIN y");
+  auto v = parser.parse_statement();
+  auto *sel = std::get_if<std::shared_ptr<SelectStatement>>(&v);
+  ASSERT_NE(sel, nullptr);
+  const auto &joins = (*sel)->get_joins();
+  ASSERT_EQ(joins.size(), 1u);
+  EXPECT_EQ(std::get<0>(joins[0]), "CROSS");
+  EXPECT_EQ(std::get<1>(joins[0]), "y");
+  EXPECT_EQ(std::get<3>(joins[0]), nullptr);
+}
+
+TEST(ParserAstAdvancedTest, FullOuterJoinParsed) {
+  Parser parser(
+      "SELECT * FROM fa FULL OUTER JOIN fb ON fa.id = fb.id");
+  auto v = parser.parse_statement();
+  auto *sel = std::get_if<std::shared_ptr<SelectStatement>>(&v);
+  ASSERT_NE(sel, nullptr);
+  const auto &joins = (*sel)->get_joins();
+  ASSERT_EQ(joins.size(), 1u);
+  EXPECT_EQ(std::get<0>(joins[0]), "FULL");
+  EXPECT_EQ(std::get<1>(joins[0]), "fb");
+  EXPECT_NE(std::get<3>(joins[0]), nullptr);
+}
+
+TEST(ParserAstAdvancedTest, LeftOuterJoinParsed) {
+  Parser parser("SELECT * FROM a LEFT OUTER JOIN b ON a.k = b.k");
+  auto v = parser.parse_statement();
+  auto *sel = std::get_if<std::shared_ptr<SelectStatement>>(&v);
+  ASSERT_NE(sel, nullptr);
+  const auto &joins = (*sel)->get_joins();
+  ASSERT_EQ(joins.size(), 1u);
+  EXPECT_EQ(std::get<0>(joins[0]), "LEFT");
+  EXPECT_NE(std::get<3>(joins[0]), nullptr);
+}
+
+TEST(ParserAstAdvancedTest, CrossJoinWithOnThrows) {
+  Parser parser("SELECT * FROM x CROSS JOIN y ON x.i = y.j");
+  EXPECT_THROW(parser.parse_statement(), ParseException);
 }
 
 TEST(ParserAstAdvancedTest, GroupByHavingParsed) {
