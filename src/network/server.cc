@@ -1,15 +1,11 @@
 #include "network/server.h"
 
-#include <arpa/inet.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstring>
 #include <future>
 #include <memory>
 
+#include "platform/shutdown_handler.h"
 #include "utils/logger.h"
 
 namespace db {
@@ -17,9 +13,10 @@ namespace db {
 // ==================== Connection ====================
 
 Connection::Connection(
-    int client_socket, Database *database, ThreadPool *thread_pool,
+    platform::TcpSocket client_socket, Database *database,
+    ThreadPool *thread_pool,
     std::function<void(std::shared_ptr<Connection>)> on_session_ended)
-    : client_socket_(client_socket),
+    : client_socket_(std::move(client_socket)),
       database_(database),
       thread_pool_(thread_pool),
       on_session_ended_(std::move(on_session_ended)) {}
@@ -32,10 +29,9 @@ void Connection::start() {
 
 void Connection::stop() {
   active_ = false;
-  if (client_socket_ >= 0) {
-    shutdown(client_socket_, SHUT_RDWR);
-    close(client_socket_);
-    client_socket_ = -1;
+  if (client_socket_.is_valid()) {
+    client_socket_.shutdown_both();
+    client_socket_.close();
   }
   if (connection_thread_.joinable()) {
     connection_thread_.join();
@@ -87,10 +83,9 @@ void Connection::run() {
     DB_LOG_ERROR("Connection error: ", e.what());
   }
 
-  if (client_socket_ >= 0) {
-    shutdown(client_socket_, SHUT_RDWR);
-    close(client_socket_);
-    client_socket_ = -1;
+  if (client_socket_.is_valid()) {
+    client_socket_.shutdown_both();
+    client_socket_.close();
   }
 
   DB_LOG_INFO("Client disconnected");
@@ -104,7 +99,8 @@ std::string Connection::read_message() {
   char buffer[4096];
   std::memset(buffer, 0, sizeof(buffer));
 
-  ssize_t bytes_read = recv(client_socket_, buffer, sizeof(buffer) - 1, 0);
+  ssize_t bytes_read =
+      client_socket_.recv(buffer, sizeof(buffer) - 1);
 
   if (bytes_read <= 0) {
     return "";
@@ -116,10 +112,10 @@ std::string Connection::read_message() {
 
 void Connection::send_message(const std::string &message) {
   std::lock_guard<std::mutex> lock(send_mutex_);
-  if (client_socket_ < 0) return;
+  if (!client_socket_.is_valid()) return;
 
   ssize_t bytes_sent =
-      send(client_socket_, message.c_str(), message.length(), 0);
+      client_socket_.send(message.c_str(), message.length());
   if (bytes_sent < 0) {
     throw std::runtime_error("Failed to send message");
   }
@@ -127,19 +123,9 @@ void Connection::send_message(const std::string &message) {
 
 // ==================== Server ====================
 
-Server *globalServerPtr = nullptr;
-
-void serverSignalHandler(int signal) {
-  (void)signal;
-  if (globalServerPtr) {
-    globalServerPtr->stop();
-  }
-}
-
 Server::Server(int port, size_t thread_pool_size, std::string data_directory)
     : port_(port),
       data_directory_(std::move(data_directory)),
-      server_socket_(-1),
       running_(false),
       thread_pool_(thread_pool_size),
       database_(data_directory_) {}
@@ -149,41 +135,17 @@ Server::~Server() { stop(); }
 void Server::start() {
   if (running_) return;
 
+  platform::TcpSocket::startup();
   database_.load_from_disk();
 
-  server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_socket_ < 0) {
-    throw NetworkException("Failed to create socket");
-  }
-
-  int reuse = 1;
-  if (setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                 sizeof(reuse)) < 0) {
-    close(server_socket_);
-    throw NetworkException("Failed to set socket option");
-  }
-
-  sockaddr_in server_addr;
-  std::memset(&server_addr, 0, sizeof(server_addr));
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  server_addr.sin_port = htons(port_);
-
-  if (bind(server_socket_, (struct sockaddr *)&server_addr,
-           sizeof(server_addr)) < 0) {
-    close(server_socket_);
-    throw NetworkException("Failed to bind socket");
-  }
-
-  if (listen(server_socket_, 5) < 0) {
-    close(server_socket_);
-    throw NetworkException("Failed to listen");
-  }
+  server_socket_ = platform::TcpSocket::create_tcp();
+  server_socket_.set_reuse_address(true);
+  server_socket_.bind_any(static_cast<uint16_t>(port_));
+  server_socket_.listen(5);
 
   running_ = true;
-  globalServerPtr = this;
 
-  signal(SIGINT, serverSignalHandler);
+  platform::ShutdownHandler::install([this]() { stop(); });
 
   accept_thread_ = std::thread([this] { accept_connections(); });
 
@@ -200,12 +162,15 @@ void Server::schedule_unregister_connection(std::shared_ptr<Connection> conn) {
 }
 
 void Server::stop() {
-  running_ = false;
+  if (!running_.exchange(false)) {
+    return;
+  }
 
-  if (server_socket_ >= 0) {
-    shutdown(server_socket_, SHUT_RDWR);
-    close(server_socket_);
-    server_socket_ = -1;
+  platform::ShutdownHandler::remove();
+
+  if (server_socket_.is_valid()) {
+    server_socket_.shutdown_both();
+    server_socket_.close();
   }
 
   if (accept_thread_.joinable()) {
@@ -222,6 +187,7 @@ void Server::stop() {
   }
 
   thread_pool_.shutdown();
+  platform::TcpSocket::cleanup();
   DB_LOG_INFO("Server stopped");
 }
 
@@ -237,12 +203,8 @@ int Server::get_port() const { return port_; }
 
 void Server::accept_connections() {
   while (running_) {
-    sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-
-    int client_socket = accept(server_socket_, (struct sockaddr *)&client_addr,
-                               &client_addr_len);
-    if (client_socket < 0) {
+    platform::TcpSocket client_socket;
+    if (!server_socket_.try_accept(client_socket)) {
       if (running_) {
         DB_LOG_ERROR("Failed to accept connection");
       }
@@ -250,7 +212,7 @@ void Server::accept_connections() {
     }
 
     auto connection = std::make_shared<Connection>(
-        client_socket, &database_, &thread_pool_,
+        std::move(client_socket), &database_, &thread_pool_,
         [this](std::shared_ptr<Connection> c) {
           schedule_unregister_connection(std::move(c));
         });

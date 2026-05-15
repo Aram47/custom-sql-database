@@ -10,13 +10,15 @@
 
 #include "core/database.h"
 #include "network/protocol.h"
+#include "platform/tcp_socket.h"
 #include "threading/thread_pool.h"
 
 namespace db {
 
 class Connection : public std::enable_shared_from_this<Connection> {
  public:
-  Connection(int client_socket, Database *database, ThreadPool *thread_pool,
+  Connection(platform::TcpSocket client_socket, Database *database,
+             ThreadPool *thread_pool,
              std::function<void(std::shared_ptr<Connection>)> on_session_ended);
   ~Connection();
 
@@ -24,7 +26,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   void stop();
 
  private:
-  int client_socket_{-1};
+  platform::TcpSocket client_socket_{};
   Database *database_{};
   ThreadPool *thread_pool_{};
   std::function<void(std::shared_ptr<Connection>)> on_session_ended_{};
@@ -53,7 +55,7 @@ class Server {
  private:
   int port_{};
   std::string data_directory_;
-  int server_socket_{-1};
+  platform::TcpSocket server_socket_{};
   std::atomic<bool> running_{false};
   std::thread accept_thread_{};
   ThreadPool thread_pool_;

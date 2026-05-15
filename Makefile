@@ -2,7 +2,26 @@
 
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -Iinclude
-LDFLAGS := -pthread
+
+ifeq ($(OS),Windows_NT)
+  PLATFORM_DIR := win32
+  LDFLAGS := -lws2_32
+  CXXFLAGS += -D_WIN32_WINNT=0x0601
+  DEMO_CMD = @./$(SERVER_BIN) & \
+	DEMO_PID=$$!; \
+	timeout /t 1 /nobreak >nul; \
+	./$(CLIENT_BIN) $(BUILD_DIR)/demo_queries.sql; \
+	taskkill //PID $$DEMO_PID //F >nul 2>&1; \
+	wait $$DEMO_PID 2>/dev/null || true
+else
+  PLATFORM_DIR := posix
+  LDFLAGS := -pthread
+  DEMO_CMD = @./$(SERVER_BIN) & \
+	DEMO_PID=$$!; \
+	sleep 1; \
+	./$(CLIENT_BIN) $(BUILD_DIR)/demo_queries.sql; \
+	kill $$DEMO_PID 2>/dev/null; wait $$DEMO_PID 2>/dev/null || true
+endif
 
 SRC_DIR := src
 INCLUDE_DIR := include
@@ -10,12 +29,18 @@ BUILD_DIR := build
 BIN_DIR := bin
 CLIENT_DIR := client
 DATA_DIR := data
+PLATFORM_DIR_PATH := platform/$(PLATFORM_DIR)
 
-SOURCES := $(shell find $(SRC_DIR) -name "*.cc")
+SOURCES := $(shell find $(SRC_DIR) -name "*.cc" ! -path "$(SRC_DIR)/platform/*")
+PLATFORM_SOURCES := $(wildcard $(SRC_DIR)/$(PLATFORM_DIR_PATH)/*.cc)
+COMMON_PLATFORM_SOURCES := $(SRC_DIR)/platform/tcp_client.cc
+
 MAIN_SOURCE := main.cc
 CLIENT_SOURCE := $(CLIENT_DIR)/cli_client.cc
 
 OBJECTS := $(SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
+PLATFORM_OBJECTS := $(PLATFORM_SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
+PLATFORM_OBJECTS += $(COMMON_PLATFORM_SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
 MAIN_OBJ := $(BUILD_DIR)/main.o
 
 SERVER_BIN := $(BIN_DIR)/db_server
@@ -36,20 +61,23 @@ TEST_OBJECTS := $(TEST_SOURCES:$(TEST_DIR)/%.cc=$(BUILD_DIR)/tests/%.o)
 
 RUN_TESTS_BIN := $(BIN_DIR)/run_tests
 
+CORE_OBJECTS := $(OBJECTS) $(PLATFORM_OBJECTS)
+CLIENT_OBJECTS := $(BUILD_DIR)/$(PLATFORM_DIR_PATH)/tcp_socket.o
+
 all: build
 
 server: $(SERVER_BIN)
-	@echo "✓ Database server built successfully"
+	@echo "✓ Database server built successfully ($(PLATFORM_DIR))"
 
 build: server
 
 client: $(CLIENT_BIN)
-	@echo "✓ Database client built successfully"
+	@echo "✓ Database client built successfully ($(PLATFORM_DIR))"
 
-$(SERVER_BIN): $(OBJECTS) $(MAIN_OBJ) | $(BIN_DIR)
+$(SERVER_BIN): $(CORE_OBJECTS) $(MAIN_OBJ) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(CLIENT_BIN): $(CLIENT_SOURCE) | $(BIN_DIR)
+$(CLIENT_BIN): $(CLIENT_SOURCE) $(CLIENT_OBJECTS) | $(BIN_DIR)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -84,7 +112,7 @@ $(BUILD_DIR)/tests/%.o: $(TEST_DIR)/%.cc
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(TEST_CPPFLAGS) -c $< -o $@
 
-$(RUN_TESTS_BIN): $(OBJECTS) $(TEST_OBJECTS) $(GTEST_OBJECTS) | $(BIN_DIR)
+$(RUN_TESTS_BIN): $(CORE_OBJECTS) $(TEST_OBJECTS) $(GTEST_OBJECTS) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 tests: $(RUN_TESTS_BIN)
@@ -104,11 +132,7 @@ demo: build client
 	@echo "CREATE TABLE demo_users (id INT PRIMARY KEY, name STRING NOT NULL);" > $(BUILD_DIR)/demo_queries.sql
 	@echo "INSERT INTO demo_users VALUES (1, 'Alice');" >> $(BUILD_DIR)/demo_queries.sql
 	@echo "SELECT * FROM demo_users;" >> $(BUILD_DIR)/demo_queries.sql
-	@./$(SERVER_BIN) & \
-	 DEMO_PID=$$!; \
-	 sleep 1; \
-	 ./$(CLIENT_BIN) $(BUILD_DIR)/demo_queries.sql; \
-	 kill $$DEMO_PID 2>/dev/null; wait $$DEMO_PID 2>/dev/null || true
+	$(DEMO_CMD)
 	@echo "✓ Demo finished"
 
 clean:
@@ -124,6 +148,7 @@ distclean: clean data-clean
 help:
 	@echo "SQL Database Engine - Build System"
 	@echo "===================================="
+	@echo "Platform backend: $(PLATFORM_DIR)"
 	@echo "Targets:"
 	@echo "  make build       - Build server"
 	@echo "  make client      - Build client"

@@ -1,70 +1,54 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 
+#include "platform/tcp_socket.h"
+
 class DatabaseClient {
  private:
-  int sock_fd_{-1};
+  db::platform::TcpSocket socket_{};
   std::string host_;
   int port_{};
 
  public:
   DatabaseClient(const std::string &host = "127.0.0.1", int port = 9000)
-      : sock_fd_(-1), host_(host), port_(port) {}
+      : host_(host), port_(port) {}
 
   ~DatabaseClient() { disconnect(); }
 
   bool connect() {
-    sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd_ < 0) {
-      std::cerr << "Failed to create socket" << std::endl;
+    try {
+      db::platform::TcpSocket::startup();
+      socket_ = db::platform::TcpSocket::create_tcp();
+      socket_.connect(host_, static_cast<uint16_t>(port_));
+      std::cout << "Connected to database server at " << host_ << ":" << port_
+                << std::endl;
+      return true;
+    } catch (const std::exception &e) {
+      std::cerr << "Connection failed: " << e.what() << std::endl;
+      disconnect();
       return false;
     }
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port_);
-
-    if (inet_pton(AF_INET, host_.c_str(), &server_addr.sin_addr) <= 0) {
-      std::cerr << "Invalid address" << std::endl;
-      close(sock_fd_);
-      return false;
-    }
-
-    if (::connect(sock_fd_, (struct sockaddr *)&server_addr,
-                  sizeof(server_addr)) < 0) {
-      std::cerr << "Connection failed" << std::endl;
-      close(sock_fd_);
-      return false;
-    }
-
-    std::cout << "Connected to database server at " << host_ << ":" << port_
-              << std::endl;
-    return true;
   }
 
   void disconnect() {
-    if (sock_fd_ >= 0) {
-      close(sock_fd_);
-      sock_fd_ = -1;
+    if (socket_.is_valid()) {
+      socket_.close();
     }
+    db::platform::TcpSocket::cleanup();
   }
 
   bool execute_query(const std::string &query) {
-    if (sock_fd_ < 0) {
+    if (!socket_.is_valid()) {
       std::cerr << "Not connected" << std::endl;
       return false;
     }
 
     std::string request = "QUERY|" + query + "\n";
 
-    if (send(sock_fd_, request.c_str(), request.length(), 0) < 0) {
+    if (socket_.send(request.c_str(), request.length()) < 0) {
       std::cerr << "Failed to send query" << std::endl;
       return false;
     }
@@ -113,7 +97,7 @@ class DatabaseClient {
       if (line.empty() || line[0] == '#') continue;
       query += line + " ";
       if (line.back() == ';') {
-        query.pop_back();  // Remove semicolon
+        query.pop_back();
         execute_query(query);
         query.clear();
       }
@@ -129,7 +113,7 @@ class DatabaseClient {
     char buffer[8192];
     std::memset(buffer, 0, sizeof(buffer));
 
-    ssize_t bytes_read = recv(sock_fd_, buffer, sizeof(buffer) - 1, 0);
+    ssize_t bytes_read = socket_.recv(buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
       std::cerr << "Failed to read response" << std::endl;
       return false;
@@ -138,7 +122,6 @@ class DatabaseClient {
     buffer[bytes_read] = '\0';
     std::string response(buffer);
 
-    // Parse and display response
     if (response.find("ERROR") == 0) {
       std::cerr << "Error: " << response.substr(6) << std::endl;
       return false;
@@ -151,14 +134,12 @@ class DatabaseClient {
         return true;
       }
 
-      // Parse tab-separated values
       std::istringstream iss(data);
       std::string line;
       bool first_line = true;
       while (std::getline(iss, line)) {
         if (line.empty()) continue;
 
-        // Replace tabs with pipes for display
         for (char &c : line) {
           if (c == '\t') c = ' ';
         }
@@ -204,11 +185,9 @@ int main(int argc, char *argv[]) {
   }
 
   if (argc > 1) {
-    // Batch mode: execute file
     std::cout << "Executing batch file: " << argv[1] << std::endl;
     client.run_batch_file(argv[1]);
   } else {
-    // Interactive mode
     client.interactive_mode();
   }
 

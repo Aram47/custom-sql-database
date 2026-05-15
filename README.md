@@ -62,7 +62,7 @@ These clauses are parsed into [`SelectStatement`](include/parser/ast.h) but **[`
 |-----------|---------|
 | Language | C++17 |
 | Build | [Makefile](Makefile), `g++` |
-| Platform | POSIX (`pthread`, Berkeley sockets)—**Linux**, **macOS**, and similar; primary development target is POSIX desktops |
+| Platform | **Linux**, **macOS** (POSIX backend), **Windows** (MinGW-w64 / MSYS2, Winsock backend)—see [Build](#build) |
 | Dependencies (server & client) | C++ standard library only for `bin/db_server` and `bin/db_client` |
 | Dependencies (tests) | Optional: [GoogleTest](https://github.com/google/googletest) via git submodule [`third_party/googletest`](third_party/googletest)—run `git submodule update --init --recursive` before `make test` |
 
@@ -81,9 +81,11 @@ custom-sql-database/   # repository root (rename locally if needed)
 │   ├── storage/       # PersistenceManager
 │   ├── threading/     # ThreadPool, WorkQueue
 │   ├── network/       # Server, Connection, Protocol
+│   ├── platform/      # TcpSocket, ShutdownHandler, process helpers (OS abstraction)
 │   ├── types/         # Value, DataType, TypeConverter
 │   └── utils/         # Logger, Exceptions
 ├── src/               # Implementations (.cc), mirrors include/
+│   └── platform/      # posix/ and win32/ backends + shared tcp_client.cc
 ├── tests/             # GoogleTest unit and integration tests
 ├── third_party/
 │   └── googletest/    # git submodule (for `make test`)
@@ -116,7 +118,34 @@ custom-sql-database/   # repository root (rename locally if needed)
 | `make distclean` | `clean` + `data-clean` |
 | `make help` | Short help for targets |
 
-Compiler flags: `-std=c++17 -Wall -Wextra -O2 -Iinclude`, link with `-pthread`. Test objects are built with extra include paths for GoogleTest ([Makefile](Makefile)).
+Compiler flags: `-std=c++17 -Wall -Wextra -O2 -Iinclude`. The [Makefile](Makefile) selects the platform backend automatically (`posix` on Linux/macOS, `win32` when `OS=Windows_NT`).
+
+### Supported platforms
+
+| OS | Toolchain | Link flags | Notes |
+|----|-----------|------------|-------|
+| **Linux** | `g++`, `make` | `-pthread` | Primary CI/dev target |
+| **macOS** | Xcode CLT or Homebrew `g++`, `make` | `-pthread` | Same POSIX backend as Linux |
+| **Windows** | MSYS2 MinGW-w64 (`mingw-w64-x86_64-gcc`, `make`) | `-lws2_32` | Build from **MSYS2 MinGW** shell, not MSVC |
+
+**Linux / macOS:**
+
+```bash
+make build
+make client
+make test
+```
+
+**Windows (MSYS2 MinGW 64-bit):**
+
+```bash
+pacman -S --needed mingw-w64-x86_64-gcc make
+make build
+make client
+make test
+```
+
+`make help` prints the active backend (`posix` or `win32`). Test objects use extra include paths for GoogleTest.
 
 ---
 
@@ -147,7 +176,8 @@ This compiles and runs `bin/run_tests`, which links the full server object set w
 | [`database_test.cc`](tests/database_test.cc), [`database_extended_test.cc`](tests/database_extended_test.cc) | Database operations and persistence-oriented checks |
 | [`select_join_test.cc`](tests/select_join_test.cc) | INNER / LEFT / RIGHT / FULL OUTER / CROSS joins, cartesian INNER without **ON**, chaining, parse errors, ambiguity, wildcard headers |
 | [`protocol_test.cc`](tests/protocol_test.cc) | Wire protocol formatting and parsing |
-| [`network_integration_test.cc`](tests/network_integration_test.cc) | TCP server + client-style exchange |
+| [`platform_tcp_socket_test.cc`](tests/platform_tcp_socket_test.cc) | Platform `TcpSocket` loopback send/recv |
+| [`network_integration_test.cc`](tests/network_integration_test.cc) | TCP server + client-style exchange via [`tcp_exchange`](include/platform/tcp_client.h) |
 
 Shared helpers live in [`tests/test_util.hh`](tests/test_util.hh).
 
@@ -160,7 +190,7 @@ Shared helpers live in [`tests/test_util.hh`](tests/test_util.hh).
 ```bash
 make run
 # listens on all interfaces (INADDR_ANY), port from main.cc (default 9000)
-# stop: Ctrl+C (SIGINT)
+# stop: Ctrl+C (POSIX) or Ctrl+C / Ctrl+Break (Windows)
 ```
 
 **Terminal 2 — client:**
@@ -187,7 +217,9 @@ Lines starting with `#` and empty lines are ignored. A statement is assembled un
 | Client: `Connection failed` | Server not running, or wrong host/port in `cli_client.cc` (defaults: `127.0.0.1:9000`). |
 | Empty or truncated response | Query or result larger than the receive buffer—see [Network protocol](#network-protocol). |
 | Data missing after `Ctrl+C` | Saves run after successful **INSERT**/**UPDATE**/**DELETE**/**CREATE TABLE**; abrupt termination may leave files at the last successful save only. |
-| Compile errors | Need a **C++17** compiler and POSIX headers (`unistd.h`, `sys/socket.h`). |
+| Compile errors | Need a **C++17** compiler (`g++` 8+). On Windows use the **MinGW** MSYS2 environment, not plain `cmd` without `g++`. |
+| Windows: link errors mentioning `socket` / `WSAStartup` | Build with the project Makefile (adds `-lws2_32`); ensure `TcpSocket::startup()` ran (server/client call it on start). |
+| Windows: `make demo` fails | Demo uses shell-specific process control; run server and client manually in two terminals if needed. |
 
 ---
 
@@ -431,7 +463,7 @@ Useful references:
 
 - SQL standard (ISO/IEC 9075)—conceptual background.
 - C++17 and standard library documentation.
-- POSIX socket programming.
+- Berkeley sockets / Winsock2 (abstracted in [`include/platform/`](include/platform/)).
 - Database textbooks (e.g. Silberschatz, Korth, Sudarshan—*Database System Concepts*).
 
-**Build:** `g++`, C++17, `-Iinclude`, `-pthread`. **Target:** POSIX (Linux, macOS, and similar).
+**Build:** `g++`, C++17, `-Iinclude`. **Targets:** Linux, macOS (POSIX backend), Windows MinGW-w64 (Winsock backend).
