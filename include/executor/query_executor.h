@@ -7,10 +7,13 @@
 
 #include "core/row.h"
 #include "core/table.h"
+#include "executor/select_expression_evaluator.h"
 #include "parser/ast.h"
 #include "utils/exceptions.h"
 
 namespace db {
+
+class Database;
 
 // Result set for queries
 struct QueryResult {
@@ -47,45 +50,55 @@ class QueryExecutor {
 // SELECT executor
 class SelectExecutor : public QueryExecutor {
  public:
-  SelectExecutor(std::shared_ptr<SelectStatement> stmt, Table *table);
+  SelectExecutor(std::shared_ptr<SelectStatement> stmt, Table *table,
+                 Database *database = nullptr);
   QueryResult execute() override;
 
  private:
   std::shared_ptr<SelectStatement> stmt_;
   Table *table_;
+  Database *database_;
 };
 
 // INSERT executor
 class InsertExecutor : public QueryExecutor {
  public:
-  InsertExecutor(std::shared_ptr<InsertStatement> stmt, Table *table);
+  InsertExecutor(std::shared_ptr<InsertStatement> stmt, Table *table,
+                 Database *database = nullptr);
   QueryResult execute() override;
 
  private:
   std::shared_ptr<InsertStatement> stmt_;
   Table *table_;
+  Database *database_;
 };
 
 // UPDATE executor
 class UpdateExecutor : public QueryExecutor {
  public:
-  UpdateExecutor(std::shared_ptr<UpdateStatement> stmt, Table *table);
+  UpdateExecutor(std::shared_ptr<UpdateStatement> stmt, Table *table,
+                 Database *database = nullptr);
   QueryResult execute() override;
+  std::vector<size_t> collect_matching_indices() const;
 
  private:
   std::shared_ptr<UpdateStatement> stmt_;
   Table *table_;
+  Database *database_;
 };
 
 // DELETE executor
 class DeleteExecutor : public QueryExecutor {
  public:
-  DeleteExecutor(std::shared_ptr<DeleteStatement> stmt, Table *table);
+  DeleteExecutor(std::shared_ptr<DeleteStatement> stmt, Table *table,
+                 Database *database = nullptr);
   QueryResult execute() override;
+  std::vector<size_t> collect_matching_indices() const;
 
  private:
   std::shared_ptr<DeleteStatement> stmt_;
   Table *table_;
+  Database *database_;
 };
 
 // CREATE TABLE executor
@@ -100,4 +113,8 @@ class CreateTableExecutor : public QueryExecutor {
   std::map<std::string, std::unique_ptr<Table>> *tables_;
 };
 
+void bind_subquery_evaluators(SelectExpressionEvaluator &eval,
+                              Database *database);
+
 }  // namespace db
+

@@ -29,8 +29,34 @@ std::string Token::token_type_to_string(TokenType type) {
       return "DELETE";
     case TokenType::CREATE:
       return "CREATE";
+    case TokenType::DROP:
+      return "DROP";
+    case TokenType::ALTER:
+      return "ALTER";
+    case TokenType::ADD:
+      return "ADD";
+    case TokenType::COLUMN:
+      return "COLUMN";
+    case TokenType::RENAME:
+      return "RENAME";
+    case TokenType::TO:
+      return "TO";
+    case TokenType::CONSTRAINT:
+      return "CONSTRAINT";
+    case TokenType::PRIMARY:
+      return "PRIMARY";
+    case TokenType::KEY:
+      return "KEY";
+    case TokenType::UNIQUE:
+      return "UNIQUE";
+    case TokenType::BETWEEN:
+      return "BETWEEN";
     case TokenType::TABLE:
       return "TABLE";
+    case TokenType::VIEW:
+      return "VIEW";
+    case TokenType::IF:
+      return "IF";
     case TokenType::FROM:
       return "FROM";
     case TokenType::WHERE:
@@ -79,6 +105,40 @@ std::string Token::token_type_to_string(TokenType type) {
       return "AS";
     case TokenType::DISTINCT:
       return "DISTINCT";
+    case TokenType::INDEX:
+      return "INDEX";
+    case TokenType::REFERENCES:
+      return "REFERENCES";
+    case TokenType::FOREIGN:
+      return "FOREIGN";
+    case TokenType::CASCADE:
+      return "CASCADE";
+    case TokenType::RESTRICT:
+      return "RESTRICT";
+    case TokenType::BEGIN:
+      return "BEGIN";
+    case TokenType::COMMIT:
+      return "COMMIT";
+    case TokenType::ROLLBACK:
+      return "ROLLBACK";
+    case TokenType::PREPARE:
+      return "PREPARE";
+    case TokenType::EXECUTE:
+      return "EXECUTE";
+    case TokenType::DEALLOCATE:
+      return "DEALLOCATE";
+    case TokenType::IN:
+      return "IN";
+    case TokenType::EXISTS:
+      return "EXISTS";
+    case TokenType::DEFAULT:
+      return "DEFAULT";
+    case TokenType::VACUUM:
+      return "VACUUM";
+    case TokenType::EXPLAIN:
+      return "EXPLAIN";
+    case TokenType::CHECK:
+      return "CHECK";
     case TokenType::COUNT:
       return "COUNT";
     case TokenType::SUM:
@@ -123,6 +183,8 @@ std::string Token::token_type_to_string(TokenType type) {
       return ";";
     case TokenType::ASTERISK:
       return "*";
+    case TokenType::PARAMETER:
+      return "PARAMETER";
     case TokenType::IDENTIFIER:
       return "IDENTIFIER";
     case TokenType::NUMBER:

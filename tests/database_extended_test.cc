@@ -174,17 +174,19 @@ TEST(DatabaseExtendedTest, FloatBooleanDateUuidColumns) {
   EXPECT_EQ(r.rows[0][3].as_string(), "550e8400-e29b-41d4-a716-446655440000");
 }
 
-TEST(DatabaseExtendedTest, UpdateSetArithmeticNotSupportedFailsConstraint) {
+TEST(DatabaseExtendedTest, UpdateSetArithmetic) {
   test_util::TempDbDir tmp;
   Database db(tmp.path_string());
   ASSERT_TRUE(db.execute_query(
                    "CREATE TABLE ut (id INT PRIMARY KEY, x INT NOT NULL)")
                   .success);
   ASSERT_TRUE(db.execute_query("INSERT INTO ut VALUES (1, 10)").success);
-  // UpdateExecutor only evaluates literals/column refs — binop yields empty Value (NULL)
   auto r = db.execute_query("UPDATE ut SET x = id + 5 WHERE id = 1");
-  ASSERT_FALSE(r.success);
-  EXPECT_NE(r.message.find("Update failed"), std::string::npos);
+  ASSERT_TRUE(r.success) << r.message;
+  auto sel = db.execute_query("SELECT x FROM ut WHERE id = 1");
+  ASSERT_TRUE(sel.success) << sel.message;
+  ASSERT_EQ(sel.rows.size(), 1u);
+  EXPECT_EQ(sel.rows[0][0].as_int(), 6);
 }
 
 }  // namespace

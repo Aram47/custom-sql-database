@@ -10,7 +10,7 @@ namespace db {
 
 class Protocol {
  public:
-  // Request format: "QUERY|<sql>\n"
+  // Request format: "QUERY|<sql>\n", "AUTH|<user>|<password>\n", "PING|\n", "QUIT|\n"
   // Response format: "OK|<result_data>\n" or "ERROR|<error_msg>\n"
 
   struct Request {

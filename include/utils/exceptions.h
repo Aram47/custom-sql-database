@@ -61,4 +61,11 @@ class NetworkException : public DatabaseException {
       : DatabaseException("Network Error: " + message) {}
 };
 
+/** Raised when the lock wait-for graph contains a cycle. */
+class DeadlockException : public DatabaseException {
+ public:
+  explicit DeadlockException(const std::string &message)
+      : DatabaseException("Deadlock Error: " + message) {}
+};
+
 }  // namespace db

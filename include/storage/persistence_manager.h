@@ -10,30 +10,39 @@
 
 namespace db {
 
+/**
+ * Binary on-disk persistence for tables.
+ * Saves use a temporary file then rename for atomic replace.
+ */
 class PersistenceManager {
  public:
-  // Save a single table to file
+  /** Saves a single table atomically (write .tmp then rename to .db). */
   static void save_table(const Table &table, const std::string &file_path);
-
-  // Load a table from file
   static std::unique_ptr<Table> load_table(const std::string &file_path);
-
-  // Save multiple tables to a directory
   static void save_database(
       const std::map<std::string, std::unique_ptr<Table>> &tables,
       const std::string &directory_path);
-
-  // Load multiple tables from directory
   static std::map<std::string, std::unique_ptr<Table>> load_database(
       const std::string &directory_path);
+  /** Removes {directory}/{table_name}.db and any stray .tmp. */
+  static void remove_table_file(const std::string &directory_path,
+                                const std::string &table_name);
+  /** Renames on-disk table file from old_name.db to new_name.db. */
+  static void rename_table_file(const std::string &directory_path,
+                                const std::string &old_name,
+                                const std::string &new_name);
+  static std::string table_file_path(const std::string &directory_path,
+                                     const std::string &table_name);
 
  private:
   static constexpr uint32_t kMagicNumber = 0x44425442;  // "DBTB"
-  static constexpr uint16_t kVersion = 1;
-
-  // Helper methods
+  static constexpr uint16_t kVersion = 5;
+  static constexpr uint16_t kMinSupportedVersion = 1;
   static void write_header(std::ofstream &file, const std::string &table_name);
-  static void read_header(std::ifstream &file, std::string &table_name);
+  /** Reads magic/version/name; returns file format version. */
+  static uint16_t read_header(std::ifstream &file, std::string &table_name);
+  static void write_string(std::ofstream &file, const std::string &value);
+  static std::string read_string(std::ifstream &file);
 };
 
 }  // namespace db

@@ -1,6 +1,14 @@
-# Educational SQL Engine with Network Server
+# NoBugDB
 
-A modular **C++17** database server: parsing a subset of SQL, in-memory table operations, binary on-disk persistence, and **TCP** access via a simple text protocol. The project is aimed at learning how database engines work, not at production workloads.
+The world's first database with absolutely no bugs.
+
+<small>
+There are no bugs.
+
+Only undocumented features.
+</small>
+
+**NoBugDB** (`nobugdb`) is a modular **C++17** SQL engine with a TCP server: parsing a subset of SQL, in-memory table operations, binary on-disk persistence, and client access via a simple text protocol.
 
 ---
 
@@ -31,15 +39,20 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 
 ### Fully supported by the executor
 
-- **CREATE TABLE** — schema with types and `PRIMARY KEY`, `UNIQUE`, `NOT NULL` constraints.
+- **CREATE TABLE** — schema with types and `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, and table/column `CHECK (expression)` constraints.
+- **CREATE VIEW** / **DROP VIEW** — named SELECT definitions; `SELECT`/`JOIN` against a view materializes its defining query (non-updatable in v1).
+- **DROP TABLE** — removes the table from memory and deletes its `.db` file.
+- **ALTER TABLE** — `ADD`/`DROP COLUMN`, `RENAME TO` / `RENAME COLUMN`, `ADD`/`DROP PRIMARY KEY`, `ADD`/`DROP UNIQUE (col)`, `ALTER COLUMN ... SET|DROP NOT NULL`, `ADD`/`DROP CHECK`.
 - **INSERT** — one or many rows; explicit column list or table column order.
 - **UPDATE** / **DELETE** — optional **WHERE**. **`UPDATE` `SET`** accepts only literals and column references on the right-hand side (no arithmetic).
-- **SELECT** — column list or `*`, optional **WHERE**, expressions in the SELECT list (arithmetic, qualified or unambiguous column references), **DISTINCT**, **GROUP BY**, **HAVING**, **ORDER BY** (ASC/DESC), **LIMIT**, **OFFSET**. **FROM** may name a single table **or** chain several tables with **JOIN**: **INNER** (including bare `JOIN`), **LEFT** / **RIGHT** / **FULL** with optional **OUTER**, and **CROSS**. **ON** is required for **LEFT**, **RIGHT**, and **FULL**; optional for **INNER** (without **ON**, the join is a Cartesian product); forbidden for **CROSS** (parse error if **ON** is present). With multiple tables, [`JoinSelectExecutor`](src/executor/join_select_executor.cc) runs nested-loop joins; `SELECT *` emits **qualified** headers (`alias.column`). Bare column names must be unique across participating tables or execution reports an ambiguity error. Single-table queries still use [`SelectExecutor`](src/executor/query_executor.cc). After scan/join, [`SelectPipeline`](include/executor/select_pipeline.h) applies relational operators: [`GroupAggregateOperator`](include/executor/group_aggregate_operator.h) (grouping + aggregates + HAVING), [`DistinctOperator`](include/executor/distinct_operator.h), [`SortOperator`](include/executor/sort_operator.h), [`LimitOffsetOperator`](include/executor/limit_offset_operator.h). Expression evaluation shared via [`SelectExpressionEvaluator`](include/executor/select_expression_evaluator.h).
+- **EXPLAIN** — prefix any statement (`EXPLAIN SELECT ...`); the command is executed and a textual plan is returned in column `QUERY PLAN` (access path / join order for SELECT).
+- **SELECT** — column list or `*`, optional **WHERE** (including **BETWEEN**), expressions in the SELECT list (arithmetic, qualified or unambiguous column references), **DISTINCT**, **GROUP BY**, **HAVING**, **ORDER BY** (ASC/DESC), **LIMIT**, **OFFSET**. **FROM** may name a single table **or** chain several tables with **JOIN**: **INNER** (including bare `JOIN`), **LEFT** / **RIGHT** / **FULL** with optional **OUTER**, and **CROSS**. **ON** is required for **LEFT**, **RIGHT**, and **FULL**; optional for **INNER** (without **ON**, the join is a Cartesian product); forbidden for **CROSS** (parse error if **ON** is present). With multiple tables, [`JoinSelectExecutor`](src/executor/join_select_executor.cc) runs nested-loop joins (equi-JOIN probes a B-tree on the right side when the join column is indexed); `SELECT *` emits **qualified** headers (`alias.column`). Bare column names must be unique across participating tables or execution reports an ambiguity error. Single-table queries still use [`SelectExecutor`](src/executor/query_executor.cc). After scan/join, [`SelectPipeline`](include/executor/select_pipeline.h) applies relational operators: [`GroupAggregateOperator`](include/executor/group_aggregate_operator.h) (grouping + aggregates + HAVING), [`DistinctOperator`](include/executor/distinct_operator.h), [`SortOperator`](include/executor/sort_operator.h), [`LimitOffsetOperator`](include/executor/limit_offset_operator.h). Expression evaluation shared via [`SelectExpressionEvaluator`](include/executor/select_expression_evaluator.h).
+- **Indexes** — in-memory B-trees on **PRIMARY KEY** / **UNIQUE** columns; used for equality and range predicates in WHERE / UPDATE / DELETE and for INNER/LEFT equi-JOIN probes.
 - Aggregate functions: **COUNT** (`*` or expression), **SUM**, **AVG**, **MIN**, **MAX** with **GROUP BY** or implicit single-group queries (`SELECT COUNT(*) FROM t`). Scalar functions in row expressions: **UPPER**, **LOWER**, **LENGTH**.
 - **Types**: `INT`, `FLOAT`, `STRING`, `BOOLEAN`, `DATE`, `UUID` and synonyms from [`data_type.h`](include/types/data_type.h) (`INTEGER`, `REAL`, `TEXT`, `VARCHAR`, `BOOL`).
-- **Persistence**: directory of binary table files; successful mutations trigger a save.
-- **Network**: multi-client TCP server; **QUERY**, **PING**, **QUIT** commands.
-- **Client**: interactive mode and batch execution from a `.sql` file.
+- **Persistence**: atomic per-table saves (write `.tmp` then rename); only dirty tables are flushed after mutations.
+- **Network**: multi-client TCP server; **AUTH**, **QUERY**, **PING**, **QUIT** commands; optional file-based auth with `admin` / `reader` roles.
+- **Client**: interactive mode and batch execution from a `.sql` file; optional `--user` / `--password` for AUTH.
 
 ### SELECT limitations (v1)
 
@@ -48,9 +61,9 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 - **ORDER BY** column position (`ORDER BY 1`) is not supported; use column names or expressions.
 - **UPDATE** `SET` still evaluates only **literals** and **column references** on the right-hand side (no arithmetic in `SET`), via [`SelectExpressionEvaluator::evaluate_dml_assignment_rhs`](include/executor/select_expression_evaluator.h).
 
-### C++ API only, not SQL
+### C++ API
 
-- **`Database::dropTable`** removes a table from memory and from the persisted file set on the next save; there is no **`DROP TABLE`** statement in the SQL parser.
+- **`Database::drop_table`** / SQL **`DROP TABLE`** both remove the table from memory and delete its persisted `.db` file.
 
 ---
 
@@ -61,17 +74,17 @@ A modular **C++17** database server: parsing a subset of SQL, in-memory table op
 | Language | C++17 |
 | Build | [Makefile](Makefile), `g++` |
 | Platform | **Linux**, **macOS** (POSIX backend), **Windows** (MinGW-w64 / MSYS2, Winsock backend)—see [Build](#build) |
-| Dependencies (server & client) | C++ standard library only for `bin/db_server` and `bin/db_client` |
+| Dependencies (server & client) | C++ standard library only for `bin/nobugdb` and `bin/nobugdb-cli` |
 | Dependencies (tests) | Optional: [GoogleTest](https://github.com/google/googletest) via git submodule [`third_party/googletest`](third_party/googletest)—run `git submodule update --init --recursive` before `make test` |
 
-Server entry point: [`main.cc`](main.cc). Port **9000** and thread-pool size **4** are hard-coded literals; change defaults by editing the `Server(...)` call in `main.cc` (or add CLI argument parsing).
+Server entry point: [`main.cc`](main.cc). Defaults: port **9000**, workers **4**, data directory **`data`**, log level **INFO**. Override via CLI flags (see [Running](#running)).
 
 ---
 
 ## Project structure
 
 ```
-custom-sql-database/   # repository root (rename locally if needed)
+nobugdb/               # repository root
 ├── include/
 │   ├── core/          # Database, Table, Row, Column
 │   ├── parser/        # Lexer, Parser, AST, Token
@@ -103,9 +116,9 @@ custom-sql-database/   # repository root (rename locally if needed)
 
 | Target | Action |
 |--------|--------|
-| `make` / `make all` / `make build` | Build server → `bin/db_server` |
+| `make` / `make all` / `make build` | Build server → `bin/nobugdb` |
 | `make server` | Same, with a success message |
-| `make client` | Build client → `bin/db_client` |
+| `make client` | Build client → `bin/nobugdb-cli` |
 | `make run` | Build and run the server |
 | `make client-run` | Build and run the client (interactive) |
 | `make demo` | Server in background, runs temporary SQL from `build/demo_queries.sql`, then stops server |
@@ -171,10 +184,17 @@ This compiles and runs `bin/run_tests`, which links the full server object set w
 | [`value_test.cc`](tests/value_test.cc) | `Value` type behavior |
 | [`type_converter_test.cc`](tests/type_converter_test.cc) | Type conversion |
 | [`row_test.cc`](tests/row_test.cc) | Row layout and access |
+| [`ddl_test.cc`](tests/ddl_test.cc) | **DROP TABLE**, **ALTER TABLE**, **BETWEEN** parse |
+| [`check_constraint_test.cc`](tests/check_constraint_test.cc) | **CHECK** on CREATE/ALTER, INSERT/UPDATE enforcement, NULL semantics, persist v5 |
+| [`view_test.cc`](tests/view_test.cc) | **CREATE**/**DROP VIEW**, SELECT from view, JOIN views, name clash, nesting/cycles, persist reload, EXPLAIN `ViewScan` |
+| [`persistence_test.cc`](tests/persistence_test.cc) | Atomic save, dirty-only flush, drop/rename files |
+| [`btree_index_test.cc`](tests/btree_index_test.cc) | B-tree lookups, indexed SELECT / JOIN |
+| [`cli_options_test.cc`](tests/cli_options_test.cc) | Server CLI flag parsing |
 | [`database_test.cc`](tests/database_test.cc), [`database_extended_test.cc`](tests/database_extended_test.cc) | Database operations and persistence-oriented checks |
 | [`select_join_test.cc`](tests/select_join_test.cc) | INNER / LEFT / RIGHT / FULL OUTER / CROSS joins, cartesian INNER without **ON**, chaining, parse errors, ambiguity, wildcard headers |
 | [`select_relational_ops_test.cc`](tests/select_relational_ops_test.cc) | **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**/**OFFSET**, **COUNT**/**SUM**/**AVG**/**MIN**/**MAX**, join + grouping |
-| [`protocol_test.cc`](tests/protocol_test.cc) | Wire protocol formatting and parsing |
+| [`planner_test.cc`](tests/planner_test.cc) | Access path and join-order planner unit tests |
+| [`explain_test.cc`](tests/explain_test.cc) | **EXPLAIN** parse, plan output, and side-effect execution |
 | [`platform_tcp_socket_test.cc`](tests/platform_tcp_socket_test.cc) | Platform `TcpSocket` loopback send/recv |
 | [`network_integration_test.cc`](tests/network_integration_test.cc) | TCP server + client-style exchange via [`tcp_exchange`](include/platform/tcp_client.h) |
 
@@ -188,9 +208,38 @@ Shared helpers live in [`tests/test_util.hh`](tests/test_util.hh).
 
 ```bash
 make run
-# listens on all interfaces (INADDR_ANY), port from main.cc (default 9000)
+# or:
+./bin/nobugdb --port 9000 --workers 4 --data-dir data --log-level INFO
+# flags: -p/--port, -w/--workers, -d/--data-dir, --log-level,
+#         --auth-file, --require-auth, --no-require-auth, --bootstrap-admin, -h/--help
+# listens on all interfaces (INADDR_ANY)
 # stop: Ctrl+C (POSIX) or Ctrl+C / Ctrl+Break (Windows)
 ```
+
+**Optional authentication:**
+
+```bash
+# Create users.conf with an admin account, then require AUTH before QUERY
+./bin/nobugdb --data-dir data --auth-file data/users.conf --bootstrap-admin 'secret'
+
+# Client with credentials (password may also come from NOBUGDB_PASSWORD)
+./bin/nobugdb-cli --user admin --password secret
+./bin/nobugdb-cli -u admin --password secret path/to/queries.sql
+```
+
+Users file format (`username:role:salt_hex:hash_hex`):
+
+```
+# role is admin or reader
+# hash = SHA-256(salt_bytes || password_utf8) as hex; salt is 16 bytes
+admin:admin:<32_hex_chars_salt>:<64_hex_chars_hash>
+viewer:reader:<salt>:<hash>
+```
+
+- **`admin`**: all SQL.
+- **`reader`**: SELECT, EXPLAIN of allowed statements, BEGIN/COMMIT/ROLLBACK, PREPARE/EXECUTE of read-only SQL; writers and DDL denied.
+- Without `--auth-file`, auth is off (open QUERY, as before). With `--auth-file`, `--require-auth` defaults to on unless `--no-require-auth`.
+- Passwords are never logged (AUTH payloads are redacted). This is a simple teaching/demo auth layer — **not production-hardened** (no TLS, no rate limiting, SHA-256 of salt+password only).
 
 **Terminal 2 — client:**
 
@@ -201,7 +250,7 @@ make client-run
 Batch mode:
 
 ```bash
-./bin/db_client path/to/queries.sql
+./bin/nobugdb-cli path/to/queries.sql
 ```
 
 Lines starting with `#` and empty lines are ignored. A statement is assembled until a line ends with `;`.
@@ -212,7 +261,7 @@ Lines starting with `#` and empty lines are ignored. A statement is assembled un
 
 | Symptom | Likely cause |
 |---------|----------------|
-| `Failed to bind socket` | Port in use or previous server still holding it—change the port in `main.cc` or free the port (`SO_REUSEADDR` is already enabled). |
+| `Failed to bind socket` | Port in use or previous server still holding it—pass `--port` / `-p` or free the port (`SO_REUSEADDR` is already enabled). |
 | Client: `Connection failed` | Server not running, or wrong host/port in `cli_client.cc` (defaults: `127.0.0.1:9000`). |
 | Empty or truncated response | Query or result larger than the receive buffer—see [Network protocol](#network-protocol). |
 | Data missing after `Ctrl+C` | Saves run after successful **INSERT**/**UPDATE**/**DELETE**/**CREATE TABLE**; abrupt termination may leave files at the last successful save only. |
@@ -224,22 +273,23 @@ Lines starting with `#` and empty lines are ignored. A statement is assembled un
 
 ## Network protocol
 
-Client messages are UTF-8 lines terminated by `\n`. Server-side parsing: [`Protocol::parseRequest`](include/network/protocol.h).
+Client messages are UTF-8 lines terminated by `\n`. Server-side parsing: [`Protocol::parse_request`](include/network/protocol.h).
 
 ### Requests
 
 | Kind | Format | Action |
 |------|--------|--------|
-| SQL | Line built like the CLI: protocol verb **QUERY**, a delimiter ASCII `\|` (U+007C), the SQL text, then LF `\n` | Run SQL via [`Database::execute_query`](src/core/database.cc) |
-| Health check | **PING** + `\|` + payload + `\n` — delimiter required (`Protocol::parseRequest`) | Response `PONG\n` |
-| Quit | **QUIT** + `\|` + payload + `\n` | Response `OK|Goodbye\n`, session ends |
+| Auth | **AUTH** + `\|` + username + `\|` + password + `\n` | Verify credentials; response `OK|authenticated\n` or `ERROR|...` |
+| SQL | Line built like the CLI: protocol verb **QUERY**, a delimiter ASCII `\|` (U+007C), the SQL text, then LF `\n` | Run SQL via [`Database::execute_query`](src/core/database.cc) (requires prior AUTH when `--require-auth`) |
+| Health check | **PING** + `\|` + payload + `\n` — delimiter required (`Protocol::parse_request`) | Response `PONG\n` (allowed without AUTH) |
+| Quit | **QUIT** + `\|` + payload + `\n` | Response `OK|Goodbye\n`, session ends (allowed without AUTH) |
 
-[`cli_client.cc`](client/cli_client.cc) sends **`QUERY|...`** only.
+Unauthenticated connections (when auth is required) may only send **AUTH**, **PING**, and **QUIT**. [`cli_client.cc`](client/cli_client.cc) sends **AUTH** when `--user` / `--password` are set, then **QUERY**.
 
 ### Responses
 
-- Success: prefix **`OK|`**, then newline; first line is column names separated by **tab** `\t`; following lines are result rows, fields separated by `\t`. Implementation: [`Protocol::format_response`](src/network/protocol.cc).
-- Error: **`ERROR|<text>\n`**.
+- Success: prefix **`OK|`**, then newline; first line is column names separated by **tab** `\t`; following lines are result rows, fields separated by `\t`. Implementation: [`Protocol::format_response`](src/network/protocol.cc). Auth success is `OK|authenticated\n`.
+- Error: **`ERROR|<text>\n`** (e.g. `authentication required`, `permission denied`).
 
 Limitation: a single read is capped at **4096** bytes on the server ([`Connection::read_message`](src/network/server.cc)) and **8192** bytes on the client when receiving—large queries or wide results need protocol changes (framing / length prefix).
 
@@ -251,11 +301,13 @@ sequenceDiagram
   participant Connection
   participant ThreadPool
   participant Database
+  Client->>Connection: AUTH|user|password newline
+  Connection-->>Client: OK|authenticated
   Client->>Connection: QUERY|sql newline
   Connection->>ThreadPool: submit handler
   ThreadPool->>Database: execute_query
   Database-->>ThreadPool: QueryResult
-  ThreadPool->>Connection: formatQueryResult
+  ThreadPool->>Connection: format_query_result
   Connection->>Client: OK|... or ERROR|...
 ```
 
@@ -263,10 +315,11 @@ sequenceDiagram
 
 ## Persistence
 
-- Default directory: **`data/`** ([`Server`](include/network/server.h) constructor argument).
+- Default directory: **`data/`** (CLI `--data-dir` / `Server` constructor).
 - On startup: [`Database::load_from_disk`](src/core/database.cc) → [`PersistenceManager::load_database`](include/storage/persistence_manager.h).
-- After successful **INSERT**, **UPDATE**, **DELETE**, **CREATE TABLE**, all tables are saved ([`persist_after_mutation`](src/core/database.cc)).
-- File format: magic **`0x44425442`** (`"DBTB"`), version **1** ([`PersistenceManager`](include/storage/persistence_manager.h)).
+- After successful mutations (**INSERT** / **UPDATE** / **DELETE** / **CREATE** / **ALTER**): only **dirty** tables are saved via atomic write (`.tmp` then rename) — [`persist_dirty_tables`](src/core/database.cc).
+- **DROP TABLE** deletes the corresponding `.db` file immediately.
+- File format: magic **`0x44425442`** (`"DBTB"`), version **4** ([`PersistenceManager`](include/storage/persistence_manager.h)); older v1–v3 files are still readable.
 
 ---
 
@@ -274,13 +327,18 @@ sequenceDiagram
 
 ### DDL
 
-- **`CREATE TABLE`** — column definitions with types and modifiers.
+- **`CREATE TABLE`** — column definitions with types and modifiers; table-level and column-level `CHECK (expression)` (no subqueries/aggregates in v1; NULL makes the predicate UNKNOWN and the row is accepted).
+- **`CREATE VIEW name AS <select>`** — stores the SELECT text; name must not collide with a table (and vice versa).
+- **`DROP VIEW [IF EXISTS] name`**
+- **`DROP TABLE`**
+- **`ALTER TABLE`** — `ADD`/`DROP COLUMN`, `RENAME TO` / `RENAME COLUMN`, primary key / unique / not-null constraint changes, `ADD [CONSTRAINT name] CHECK (...)` / `DROP CHECK name`.
 
 ### DML
 
 - **`INSERT INTO`** — `VALUES` for one or more rows.
-- **`SELECT`** — see [Features](#features): single table or **JOIN** chains, **WHERE**, **DISTINCT**, **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET**, aggregates and scalar functions.
+- **`SELECT`** — see [Features](#features): single table or **JOIN** chains, **WHERE** (incl. **BETWEEN**), **DISTINCT**, **GROUP BY**, **HAVING**, **ORDER BY**, **LIMIT**, **OFFSET**, aggregates and scalar functions.
 - **`UPDATE`** / **`DELETE`** — optional **WHERE**.
+- **`EXPLAIN`** — run any statement and return its plan as a `QUERY PLAN` result set.
 
 ### Expressions in WHERE and SELECT
 
@@ -326,7 +384,7 @@ flowchart LR
 
 - All **`Database::execute_query`** calls run under **`std::recursive_mutex`** ([`db_mutex_`](include/core/database.h)). Despite the thread pool, database work is **serialized**—no cross-client parallelism at the DB layer.
 - **`ThreadPool`** is infrastructure for future work; the bottleneck today is one global lock for parse + execute.
-- Typical cost: full table scan **O(n)** rows for filtered single-table work; each **JOIN** adds a nested loop over the right-hand table (**O(n·m·…)** with no indexes). No secondary indexes.
+- Typical cost: full table scan **O(n)** when no useful index; point/range lookups on PK/UNIQUE are **O(log n + k)** via B-tree; each **JOIN** is nested-loop (**O(n·m)** without an equi-probe index on the right side).
 
 See [Limitations and future work](#limitations-and-future-work) for more.
 
@@ -348,6 +406,17 @@ INSERT INTO users (id, name, age, active)
 VALUES (1, 'Alice', 30, true);
 
 INSERT INTO users VALUES (2, 'Bob', 25, true);
+```
+
+### Views
+
+```sql
+CREATE VIEW adults AS SELECT id, name, age FROM users WHERE age >= 18;
+
+SELECT * FROM adults;
+
+DROP VIEW adults;
+-- DROP VIEW IF EXISTS adults;
 ```
 
 ### Queries (reliable scenarios)
@@ -408,6 +477,13 @@ UPDATE users SET age = 31 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 ```
 
+### Explain
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1;
+EXPLAIN INSERT INTO users VALUES (3, 'Eve', 22, true);
+```
+
 There is still no **`table.\*`** qualifier (only `*` or qualified column names; multi-table `SELECT *` uses `alias.column` headers). See [SELECT limitations (v1)](#select-limitations-v1) for grouping and **ORDER BY** constraints.
 
 ---
@@ -443,22 +519,20 @@ At the network boundary many failures become **`ERROR|...`** text rather than C+
 
 ### Current limitations
 
-- No **transactions** or ACID isolation.
-- No **indexes**—full scans only.
-- No **query optimizer**.
-- No SQL **`DROP TABLE`** (programmatic API only).
-- No subqueries, views, or declarative foreign keys.
-- No authentication or authorization.
+- In-memory heap storage: no disk page model, buffer pool, or page locks.
+- Auth is optional file-based TCP AUTH (SHA-256 of salt+password); no TLS, no per-table GRANT, not production-hardened.
+- Cost-based planning is pragmatic (no histograms / hash-join).
 - Request/response size bounded by fixed receive buffers.
 
 ### Possible enhancements
 
-1. B-tree or hash indexes for point lookups.
-2. Transactions and write-ahead logging (WAL).
-3. Connection pooling and framed/streaming protocol for large payloads.
-4. Prepared statements and plan caching.
-5. Window functions and richer **ORDER BY** (column ordinals).
-6. Backup and recovery tooling.
+Step-by-step implementation plans (P0–P3): **[docs/plans/README.md](docs/plans/README.md)** (CHECK, views, auth, set ops, windows, hash join, functions/procedures, pages, partitions, backup, triggers, sharding).
+
+1. Connection pooling and framed/streaming protocol for large payloads.
+2. Window functions and richer **ORDER BY** (column ordinals).
+3. Backup and recovery tooling.
+4. Prepared-plan reuse beyond AST cache; richer statistics.
+5. Hash joins and fuller join reordering for outer joins.
 
 ---
 
@@ -486,7 +560,7 @@ For regression, run **`make test`** after pulling submodules; use the client and
 
 ## License and references
 
-Educational project for learning SQL engine internals and client/server query processing.
+**NoBugDB** — standalone SQL engine focused on a clear client/server execution path and extensible internals. There are no bugs. Only undocumented features.
 
 Useful references:
 

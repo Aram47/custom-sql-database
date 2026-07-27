@@ -139,6 +139,20 @@ Token Lexer::scan_token() {
       return make_token(TokenType::DOT, ".");
     case ';':
       return make_token(TokenType::SEMICOLON, ";");
+    case '?':
+      return make_token(TokenType::PARAMETER, "?");
+    case '$': {
+      if (!is_digit(current_char())) {
+        return Token(TokenType::UNKNOWN, "$", line_, column_);
+      }
+      std::string lexeme = "$";
+      int start_col = column_ - 1;
+      while (!is_at_end() && is_digit(current_char())) {
+        lexeme += current_char();
+        advance();
+      }
+      return Token(TokenType::PARAMETER, lexeme, line_, start_col);
+    }
   }
 
   return Token(TokenType::UNKNOWN, std::string(1, c), line_, column_);
@@ -303,7 +317,20 @@ TokenType Lexer::get_keyword_token_type(const std::string &keyword) const {
   if (upper == "UPDATE") return TokenType::UPDATE;
   if (upper == "DELETE") return TokenType::DELETE;
   if (upper == "CREATE") return TokenType::CREATE;
+  if (upper == "DROP") return TokenType::DROP;
+  if (upper == "ALTER") return TokenType::ALTER;
+  if (upper == "ADD") return TokenType::ADD;
+  if (upper == "COLUMN") return TokenType::COLUMN;
+  if (upper == "RENAME") return TokenType::RENAME;
+  if (upper == "TO") return TokenType::TO;
+  if (upper == "CONSTRAINT") return TokenType::CONSTRAINT;
+  if (upper == "PRIMARY") return TokenType::PRIMARY;
+  if (upper == "KEY") return TokenType::KEY;
+  if (upper == "UNIQUE") return TokenType::UNIQUE;
+  if (upper == "BETWEEN") return TokenType::BETWEEN;
   if (upper == "TABLE") return TokenType::TABLE;
+  if (upper == "VIEW") return TokenType::VIEW;
+  if (upper == "IF") return TokenType::IF;
   if (upper == "FROM") return TokenType::FROM;
   if (upper == "WHERE") return TokenType::WHERE;
   if (upper == "AND") return TokenType::AND;
@@ -328,6 +355,23 @@ TokenType Lexer::get_keyword_token_type(const std::string &keyword) const {
   if (upper == "NULL") return TokenType::NULL_KW;
   if (upper == "AS") return TokenType::AS;
   if (upper == "DISTINCT") return TokenType::DISTINCT;
+  if (upper == "INDEX") return TokenType::INDEX;
+  if (upper == "REFERENCES") return TokenType::REFERENCES;
+  if (upper == "FOREIGN") return TokenType::FOREIGN;
+  if (upper == "CASCADE") return TokenType::CASCADE;
+  if (upper == "RESTRICT") return TokenType::RESTRICT;
+  if (upper == "BEGIN") return TokenType::BEGIN;
+  if (upper == "COMMIT") return TokenType::COMMIT;
+  if (upper == "ROLLBACK") return TokenType::ROLLBACK;
+  if (upper == "PREPARE") return TokenType::PREPARE;
+  if (upper == "EXECUTE") return TokenType::EXECUTE;
+  if (upper == "DEALLOCATE") return TokenType::DEALLOCATE;
+  if (upper == "IN") return TokenType::IN;
+  if (upper == "EXISTS") return TokenType::EXISTS;
+  if (upper == "DEFAULT") return TokenType::DEFAULT;
+  if (upper == "VACUUM") return TokenType::VACUUM;
+  if (upper == "EXPLAIN") return TokenType::EXPLAIN;
+  if (upper == "CHECK") return TokenType::CHECK;
   if (upper == "COUNT") return TokenType::COUNT;
   if (upper == "SUM") return TokenType::SUM;
   if (upper == "AVG") return TokenType::AVG;

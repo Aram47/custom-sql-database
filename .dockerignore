@@ -1,0 +1,12 @@
+.git
+.github
+bin/
+build/
+data/
+tests/
+third_party/
+client/
+*.md
+docs/
+.gitignore
+.dockerignore

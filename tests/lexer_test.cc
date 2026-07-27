@@ -77,5 +77,31 @@ TEST(LexerTest, FullOuterCrossKeywords) {
   EXPECT_EQ(tokens[3].get_type(), TokenType::END_OF_INPUT);
 }
 
+TEST(LexerTest, DdlAndBetweenKeywords) {
+  Lexer lexer("DROP ALTER ADD COLUMN RENAME TO PRIMARY KEY UNIQUE BETWEEN");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_GE(tokens.size(), 11u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::DROP);
+  EXPECT_EQ(tokens[1].get_type(), TokenType::ALTER);
+  EXPECT_EQ(tokens[2].get_type(), TokenType::ADD);
+  EXPECT_EQ(tokens[3].get_type(), TokenType::COLUMN);
+  EXPECT_EQ(tokens[4].get_type(), TokenType::RENAME);
+  EXPECT_EQ(tokens[5].get_type(), TokenType::TO);
+  EXPECT_EQ(tokens[6].get_type(), TokenType::PRIMARY);
+  EXPECT_EQ(tokens[7].get_type(), TokenType::KEY);
+  EXPECT_EQ(tokens[8].get_type(), TokenType::UNIQUE);
+  EXPECT_EQ(tokens[9].get_type(), TokenType::BETWEEN);
+  EXPECT_EQ(tokens[10].get_type(), TokenType::END_OF_INPUT);
+}
+
+TEST(LexerTest, ExplainKeyword) {
+  Lexer lexer("EXPLAIN SELECT");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_GE(tokens.size(), 3u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::EXPLAIN);
+  EXPECT_EQ(tokens[1].get_type(), TokenType::SELECT);
+  EXPECT_EQ(tokens[2].get_type(), TokenType::END_OF_INPUT);
+}
+
 }  // namespace
 }  // namespace db

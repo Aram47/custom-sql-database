@@ -43,8 +43,8 @@ PLATFORM_OBJECTS := $(PLATFORM_SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
 PLATFORM_OBJECTS += $(COMMON_PLATFORM_SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
 MAIN_OBJ := $(BUILD_DIR)/main.o
 
-SERVER_BIN := $(BIN_DIR)/db_server
-CLIENT_BIN := $(BIN_DIR)/db_client
+SERVER_BIN := $(BIN_DIR)/nobugdb
+CLIENT_BIN := $(BIN_DIR)/nobugdb-cli
 
 # Google Test (git submodule: third_party/googletest)
 GTEST_ROOT := third_party/googletest/googletest
@@ -67,12 +67,12 @@ CLIENT_OBJECTS := $(BUILD_DIR)/$(PLATFORM_DIR_PATH)/tcp_socket.o
 all: build
 
 server: $(SERVER_BIN)
-	@echo "✓ Database server built successfully ($(PLATFORM_DIR))"
+	@echo "✓ NoBugDB server built successfully ($(PLATFORM_DIR))"
 
 build: server
 
 client: $(CLIENT_BIN)
-	@echo "✓ Database client built successfully ($(PLATFORM_DIR))"
+	@echo "✓ NoBugDB client built successfully ($(PLATFORM_DIR))"
 
 $(SERVER_BIN): $(CORE_OBJECTS) $(MAIN_OBJ) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
@@ -146,7 +146,7 @@ data-clean:
 distclean: clean data-clean
 
 help:
-	@echo "SQL Database Engine - Build System"
+	@echo "NoBugDB - Build System"
 	@echo "===================================="
 	@echo "Platform backend: $(PLATFORM_DIR)"
 	@echo "Targets:"

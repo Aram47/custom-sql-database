@@ -1,27 +1,46 @@
 #include <iostream>
 
 #include "network/server.h"
+#include "utils/cli_options.h"
 #include "utils/logger.h"
 
 using namespace db;
 
-int main() {
+int main(int argc, char *argv[]) {
   try {
-    // Set log level
-    Logger::get_instance().set_level(LogLevel::INFO);
-
+    std::string err_message;
+    auto options = parse_cli_options(argc, argv, err_message);
+    if (!options) {
+      std::cerr << "Error: " << err_message << "\n";
+      print_cli_usage(argv[0]);
+      return 1;
+    }
+    if (options->show_help) {
+      print_cli_usage(argv[0]);
+      return 0;
+    }
+    Logger::get_instance().set_level(options->log_level);
     DB_LOG_INFO("========================================");
-    DB_LOG_INFO("SQL Database Engine with CRUD Operations");
+    DB_LOG_INFO("NoBugDB");
+    DB_LOG_INFO("The world's first database with absolutely no bugs.");
     DB_LOG_INFO("========================================");
-    DB_LOG_INFO("Starting server on port 9000...");
-
-    // Create and start server
-    Server server(9000, 4);  // 4 worker threads
+    DB_LOG_INFO("Starting NoBugDB...");
+    DB_LOG_INFO("Checking for bugs...");
+    DB_LOG_INFO("0 bugs found.");
+    DB_LOG_INFO("Welcome.");
+    DB_LOG_INFO("Starting server on port ", options->port, " (workers=",
+                options->workers, ", data-dir=", options->data_directory, ")");
+    ServerAuthConfig auth_config;
+    auth_config.auth_file = options->auth_file;
+    auth_config.require_auth = options->effective_require_auth();
+    auth_config.bootstrap_admin_password = options->bootstrap_admin_password;
+    if (auth_config.require_auth) {
+      DB_LOG_INFO("Authentication required");
+    }
+    Server server(options->port, options->workers, options->data_directory,
+                  auth_config);
     server.start();
-
-    // Wait for shutdown signal
     server.wait();
-
     DB_LOG_INFO("Server shutdown complete");
     return 0;
   } catch (const std::exception &e) {

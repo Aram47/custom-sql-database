@@ -15,7 +15,7 @@ class TempDbDir {
   TempDbDir() {
     static std::atomic<uint64_t> seq{0};
     path_ = fs::temp_directory_path() /
-            ("custom_sql_db_test_" + std::to_string(++seq));
+            ("nobugdb_test_" + std::to_string(++seq));
     fs::create_directories(path_);
   }
 

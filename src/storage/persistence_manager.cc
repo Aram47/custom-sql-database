@@ -2,7 +2,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <vector>
 
+#include "core/check_constraint.h"
+#include "core/foreign_key.h"
 #include "types/type_converter.h"
 #include "utils/logger.h"
 
@@ -10,61 +14,123 @@ namespace fs = std::filesystem;
 
 namespace db {
 
+std::string PersistenceManager::table_file_path(
+    const std::string &directory_path, const std::string &table_name) {
+  return directory_path + "/" + table_name + ".db";
+}
+
 void PersistenceManager::save_table(const Table &table,
                                     const std::string &file_path) {
-  std::ofstream file(file_path, std::ios::binary);
-  if (!file) {
-    throw StorageException("Cannot open file for writing: " + file_path);
-  }
-
+  const std::string temp_path = file_path + ".tmp";
   try {
-    // Write header
-    write_header(file, table.get_name());
-
-    // Write number of columns
-    uint32_t colCount = table.get_column_count();
-    file.write(reinterpret_cast<const char *>(&colCount), sizeof(colCount));
-
-    // Write columns
-    for (size_t i = 0; i < colCount; ++i) {
-      const auto &col = table.get_column(i);
-
-      // Write column name
-      std::string name = col.get_name();
-      uint16_t nameLen = name.length();
-      file.write(reinterpret_cast<const char *>(&nameLen), sizeof(nameLen));
-      file.write(name.c_str(), nameLen);
-
-      // Write column type
-      uint8_t typeVal = static_cast<uint8_t>(col.get_type());
-      file.write(reinterpret_cast<const char *>(&typeVal), sizeof(typeVal));
-
-      // Write flags
-      uint8_t flags = 0;
-      if (!col.is_nullable()) flags |= 0x01;
-      if (col.is_primary_key()) flags |= 0x02;
-      if (col.is_unique()) flags |= 0x04;
-      file.write(reinterpret_cast<const char *>(&flags), sizeof(flags));
+    fs::path parent = fs::path(file_path).parent_path();
+    if (!parent.empty()) {
+      fs::create_directories(parent);
     }
-
-    // Write number of rows
-    uint32_t rowCount = table.get_row_count();
-    file.write(reinterpret_cast<const char *>(&rowCount), sizeof(rowCount));
-
-    // Write rows
-    const auto &rows = table.get_all_rows();
-    for (const auto &row : rows) {
-      for (size_t i = 0; i < colCount; ++i) {
-        auto serialized = TypeConverter::serialize_value(row.get_value(i));
-        uint32_t valueLen = serialized.size();
-        file.write(reinterpret_cast<const char *>(&valueLen), sizeof(valueLen));
-        file.write(reinterpret_cast<const char *>(serialized.data()), valueLen);
+    {
+      std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
+      if (!file) {
+        throw StorageException("Cannot open file for writing: " + temp_path);
+      }
+      write_header(file, table.get_name());
+      uint32_t col_count = static_cast<uint32_t>(table.get_column_count());
+      file.write(reinterpret_cast<const char *>(&col_count), sizeof(col_count));
+      for (size_t i = 0; i < col_count; ++i) {
+        const auto &col = table.get_column(i);
+        write_string(file, col.get_name());
+        uint8_t type_val = static_cast<uint8_t>(col.get_type());
+        file.write(reinterpret_cast<const char *>(&type_val), sizeof(type_val));
+        uint8_t flags = 0;
+        if (!col.is_nullable()) {
+          flags |= 0x01;
+        }
+        if (col.is_primary_key()) {
+          flags |= 0x02;
+        }
+        if (col.is_unique()) {
+          flags |= 0x04;
+        }
+        file.write(reinterpret_cast<const char *>(&flags), sizeof(flags));
+        uint8_t has_default = col.has_default() ? 1 : 0;
+        file.write(reinterpret_cast<const char *>(&has_default),
+                   sizeof(has_default));
+        if (has_default) {
+          auto serialized =
+              TypeConverter::serialize_value(col.get_default_value());
+          uint32_t value_len = static_cast<uint32_t>(serialized.size());
+          file.write(reinterpret_cast<const char *>(&value_len),
+                     sizeof(value_len));
+          file.write(reinterpret_cast<const char *>(serialized.data()),
+                     value_len);
+        }
+      }
+      const auto &secondary = table.get_secondary_indexes();
+      uint32_t index_count = static_cast<uint32_t>(secondary.size());
+      file.write(reinterpret_cast<const char *>(&index_count),
+                 sizeof(index_count));
+      for (const auto &[index_name, column_names] : secondary) {
+        write_string(file, index_name);
+        uint32_t col_count = static_cast<uint32_t>(column_names.size());
+        file.write(reinterpret_cast<const char *>(&col_count),
+                   sizeof(col_count));
+        for (const std::string &column_name : column_names) {
+          write_string(file, column_name);
+        }
+      }
+      const auto &foreign_keys = table.get_foreign_keys();
+      uint32_t fk_count = static_cast<uint32_t>(foreign_keys.size());
+      file.write(reinterpret_cast<const char *>(&fk_count), sizeof(fk_count));
+      for (const auto &fk : foreign_keys) {
+        uint32_t fk_col_count = static_cast<uint32_t>(fk.child_columns.size());
+        file.write(reinterpret_cast<const char *>(&fk_col_count),
+                   sizeof(fk_col_count));
+        for (const std::string &column_name : fk.child_columns) {
+          write_string(file, column_name);
+        }
+        write_string(file, fk.parent_table);
+        for (const std::string &column_name : fk.parent_columns) {
+          write_string(file, column_name);
+        }
+        uint8_t on_delete = static_cast<uint8_t>(fk.on_delete);
+        uint8_t on_update = static_cast<uint8_t>(fk.on_update);
+        file.write(reinterpret_cast<const char *>(&on_delete),
+                   sizeof(on_delete));
+        file.write(reinterpret_cast<const char *>(&on_update),
+                   sizeof(on_update));
+      }
+      const auto &checks = table.get_checks();
+      uint32_t check_count = static_cast<uint32_t>(checks.size());
+      file.write(reinterpret_cast<const char *>(&check_count),
+                 sizeof(check_count));
+      for (const auto &check : checks) {
+        write_string(file, check.name);
+        write_string(file, check.expression_text);
+      }
+      uint32_t row_count = static_cast<uint32_t>(table.get_row_count());
+      file.write(reinterpret_cast<const char *>(&row_count), sizeof(row_count));
+      const auto &rows = table.get_all_rows();
+      for (const auto &row : rows) {
+        for (size_t i = 0; i < col_count; ++i) {
+          auto serialized = TypeConverter::serialize_value(row.get_value(i));
+          uint32_t value_len = static_cast<uint32_t>(serialized.size());
+          file.write(reinterpret_cast<const char *>(&value_len),
+                     sizeof(value_len));
+          file.write(reinterpret_cast<const char *>(serialized.data()),
+                     value_len);
+        }
+      }
+      file.flush();
+      if (!file) {
+        throw StorageException("Failed while writing: " + temp_path);
       }
     }
-
-    file.close();
+    fs::rename(temp_path, file_path);
     DB_LOG_INFO("Saved table '", table.get_name(), "' to ", file_path);
+  } catch (const StorageException &) {
+    fs::remove(temp_path);
+    throw;
   } catch (const std::exception &e) {
+    fs::remove(temp_path);
     throw StorageException("Error saving table: " + std::string(e.what()));
   }
 }
@@ -75,53 +141,117 @@ std::unique_ptr<Table> PersistenceManager::load_table(
   if (!file) {
     throw StorageException("Cannot open file for reading: " + file_path);
   }
-
   try {
     std::string table_name;
-    read_header(file, table_name);
-
+    const uint16_t version = read_header(file, table_name);
     auto table = std::make_unique<Table>(table_name);
-
-    // Read columns
-    uint32_t colCount;
-    file.read(reinterpret_cast<char *>(&colCount), sizeof(colCount));
-
-    for (uint32_t i = 0; i < colCount; ++i) {
-      // Read column name
-      uint16_t nameLen;
-      file.read(reinterpret_cast<char *>(&nameLen), sizeof(nameLen));
-      std::string name(nameLen, '\0');
-      file.read(&name[0], nameLen);
-
-      // Read column type
-      uint8_t typeVal;
-      file.read(reinterpret_cast<char *>(&typeVal), sizeof(typeVal));
-      DataType type = static_cast<DataType>(typeVal);
-
-      // Read flags
-      uint8_t flags;
+    uint32_t col_count = 0;
+    file.read(reinterpret_cast<char *>(&col_count), sizeof(col_count));
+    for (uint32_t i = 0; i < col_count; ++i) {
+      std::string name = read_string(file);
+      uint8_t type_val = 0;
+      file.read(reinterpret_cast<char *>(&type_val), sizeof(type_val));
+      DataType type = static_cast<DataType>(type_val);
+      uint8_t flags = 0;
       file.read(reinterpret_cast<char *>(&flags), sizeof(flags));
-
       bool nullable = !(flags & 0x01);
-      bool primaryKey = (flags & 0x02) != 0;
+      bool primary_key = (flags & 0x02) != 0;
       bool unique = (flags & 0x04) != 0;
-
-      Column col(name, type, nullable, primaryKey, unique);
+      Column col(name, type, nullable, primary_key, unique);
+      if (version >= 4) {
+        uint8_t has_default = 0;
+        file.read(reinterpret_cast<char *>(&has_default), sizeof(has_default));
+        if (has_default) {
+          uint32_t value_len = 0;
+          file.read(reinterpret_cast<char *>(&value_len), sizeof(value_len));
+          std::vector<uint8_t> serialized(value_len);
+          file.read(reinterpret_cast<char *>(serialized.data()), value_len);
+          col.set_default_value(
+              TypeConverter::deserialize_value(serialized, type));
+        }
+      }
       table->add_column(col);
     }
-
-    // Read rows
-    uint32_t rowCount;
-    file.read(reinterpret_cast<char *>(&rowCount), sizeof(rowCount));
-
-    for (uint32_t i = 0; i < rowCount; ++i) {
+    if (version >= 2) {
+      uint32_t index_count = 0;
+      file.read(reinterpret_cast<char *>(&index_count), sizeof(index_count));
+      std::map<std::string, std::vector<std::string>> secondary;
+      for (uint32_t i = 0; i < index_count; ++i) {
+        std::string index_name = read_string(file);
+        std::vector<std::string> column_names;
+        if (version >= 3) {
+          uint32_t index_col_count = 0;
+          file.read(reinterpret_cast<char *>(&index_col_count),
+                    sizeof(index_col_count));
+          column_names.reserve(index_col_count);
+          for (uint32_t c = 0; c < index_col_count; ++c) {
+            column_names.push_back(read_string(file));
+          }
+        } else {
+          column_names.push_back(read_string(file));
+        }
+        secondary[index_name] = std::move(column_names);
+      }
+      table->set_secondary_indexes(secondary);
+      uint32_t fk_count = 0;
+      file.read(reinterpret_cast<char *>(&fk_count), sizeof(fk_count));
+      std::vector<ForeignKeyDefinition> foreign_keys;
+      foreign_keys.reserve(fk_count);
+      for (uint32_t i = 0; i < fk_count; ++i) {
+        ForeignKeyDefinition fk;
+        if (version >= 4) {
+          uint32_t fk_col_count = 0;
+          file.read(reinterpret_cast<char *>(&fk_col_count),
+                    sizeof(fk_col_count));
+          fk.child_columns.reserve(fk_col_count);
+          for (uint32_t c = 0; c < fk_col_count; ++c) {
+            fk.child_columns.push_back(read_string(file));
+          }
+          fk.parent_table = read_string(file);
+          fk.parent_columns.reserve(fk_col_count);
+          for (uint32_t c = 0; c < fk_col_count; ++c) {
+            fk.parent_columns.push_back(read_string(file));
+          }
+        } else {
+          fk.child_columns.push_back(read_string(file));
+          fk.parent_table = read_string(file);
+          fk.parent_columns.push_back(read_string(file));
+        }
+        if (version >= 3) {
+          uint8_t on_delete = 0;
+          uint8_t on_update = 0;
+          file.read(reinterpret_cast<char *>(&on_delete), sizeof(on_delete));
+          file.read(reinterpret_cast<char *>(&on_update), sizeof(on_update));
+          fk.on_delete = static_cast<ReferentialAction>(on_delete);
+          fk.on_update = static_cast<ReferentialAction>(on_update);
+        }
+        foreign_keys.push_back(std::move(fk));
+      }
+      table->set_foreign_keys(std::move(foreign_keys));
+      if (version >= 5) {
+        uint32_t check_count = 0;
+        file.read(reinterpret_cast<char *>(&check_count), sizeof(check_count));
+        std::vector<CheckConstraintDefinition> checks;
+        checks.reserve(check_count);
+        for (uint32_t i = 0; i < check_count; ++i) {
+          CheckConstraintDefinition check;
+          check.name = read_string(file);
+          check.expression_text = read_string(file);
+          check.predicate = parse_check_expression(check.expression_text);
+          checks.push_back(std::move(check));
+        }
+        table->set_checks(std::move(checks));
+      }
+    }
+    uint32_t row_count = 0;
+    file.read(reinterpret_cast<char *>(&row_count), sizeof(row_count));
+    for (uint32_t i = 0; i < row_count; ++i) {
       Row row;
-      for (uint32_t j = 0; j < colCount; ++j) {
-        uint32_t valueLen;
-        file.read(reinterpret_cast<char *>(&valueLen), sizeof(valueLen));
-        std::vector<uint8_t> serialized(valueLen);
-        file.read(reinterpret_cast<char *>(serialized.data()), valueLen);
-
+      for (uint32_t j = 0; j < col_count; ++j) {
+        uint32_t value_len = 0;
+        file.read(reinterpret_cast<char *>(&value_len), sizeof(value_len));
+        std::vector<uint8_t> serialized(value_len);
+        file.read(reinterpret_cast<char *>(serialized.data()), value_len);
         const auto &col = table->get_column(j);
         Value value =
             TypeConverter::deserialize_value(serialized, col.get_type());
@@ -129,8 +259,9 @@ std::unique_ptr<Table> PersistenceManager::load_table(
       }
       table->insert_row(row);
     }
-
     file.close();
+    table->rebuild_indexes();
+    table->clear_dirty();
     DB_LOG_INFO("Loaded table '", table_name, "' from ", file_path);
     return table;
   } catch (const std::exception &e) {
@@ -143,12 +274,9 @@ void PersistenceManager::save_database(
     const std::string &directory_path) {
   try {
     fs::create_directories(directory_path);
-
     for (const auto &[name, table] : tables) {
-      std::string file_path = directory_path + "/" + name + ".db";
-      save_table(*table, file_path);
+      save_table(*table, table_file_path(directory_path, name));
     }
-
     DB_LOG_INFO("Saved database to ", directory_path);
   } catch (const std::exception &e) {
     throw StorageException("Error saving database: " + std::string(e.what()));
@@ -158,13 +286,11 @@ void PersistenceManager::save_database(
 std::map<std::string, std::unique_ptr<Table>> PersistenceManager::load_database(
     const std::string &directory_path) {
   std::map<std::string, std::unique_ptr<Table>> tables;
-
   try {
     if (!fs::exists(directory_path)) {
       DB_LOG_INFO("Database directory does not exist: ", directory_path);
       return tables;
     }
-
     for (const auto &entry : fs::directory_iterator(directory_path)) {
       if (entry.path().extension() == ".db") {
         try {
@@ -176,7 +302,6 @@ std::map<std::string, std::unique_ptr<Table>> PersistenceManager::load_database(
         }
       }
     }
-
     DB_LOG_INFO("Loaded database from ", directory_path, " with ",
                 tables.size(), " tables");
     return tables;
@@ -185,38 +310,75 @@ std::map<std::string, std::unique_ptr<Table>> PersistenceManager::load_database(
   }
 }
 
+void PersistenceManager::remove_table_file(const std::string &directory_path,
+                                           const std::string &table_name) {
+  const std::string path = table_file_path(directory_path, table_name);
+  const std::string temp_path = path + ".tmp";
+  std::error_code err;
+  fs::remove(path, err);
+  fs::remove(temp_path, err);
+  DB_LOG_INFO("Removed table file for '", table_name, "' from ",
+              directory_path);
+}
+
+void PersistenceManager::rename_table_file(const std::string &directory_path,
+                                           const std::string &old_name,
+                                           const std::string &new_name) {
+  const std::string old_path = table_file_path(directory_path, old_name);
+  const std::string new_path = table_file_path(directory_path, new_name);
+  if (!fs::exists(old_path)) {
+    return;
+  }
+  std::error_code err;
+  fs::rename(old_path, new_path, err);
+  if (err) {
+    throw StorageException("Failed to rename table file from '" + old_name +
+                           "' to '" + new_name + "': " + err.message());
+  }
+  fs::remove(old_path + ".tmp", err);
+  DB_LOG_INFO("Renamed table file '", old_name, "' to '", new_name, "'");
+}
+
 void PersistenceManager::write_header(std::ofstream &file,
                                       const std::string &table_name) {
   uint32_t magic = kMagicNumber;
   uint16_t version = kVersion;
-
   file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
   file.write(reinterpret_cast<const char *>(&version), sizeof(version));
-
-  uint16_t nameLen = table_name.length();
-  file.write(reinterpret_cast<const char *>(&nameLen), sizeof(nameLen));
-  file.write(table_name.c_str(), nameLen);
+  write_string(file, table_name);
 }
 
-void PersistenceManager::read_header(std::ifstream &file,
-                                     std::string &table_name) {
-  uint32_t magic;
-  uint16_t version;
-
+uint16_t PersistenceManager::read_header(std::ifstream &file,
+                                         std::string &table_name) {
+  uint32_t magic = 0;
+  uint16_t version = 0;
   file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
   if (magic != kMagicNumber) {
     throw StorageException("Invalid file format");
   }
-
   file.read(reinterpret_cast<char *>(&version), sizeof(version));
-  if (version != kVersion) {
+  if (version < kMinSupportedVersion || version > kVersion) {
     throw StorageException("Unsupported file version");
   }
+  table_name = read_string(file);
+  return version;
+}
 
-  uint16_t nameLen;
-  file.read(reinterpret_cast<char *>(&nameLen), sizeof(nameLen));
-  table_name.resize(nameLen);
-  file.read(&table_name[0], nameLen);
+void PersistenceManager::write_string(std::ofstream &file,
+                                      const std::string &value) {
+  uint16_t name_len = static_cast<uint16_t>(value.length());
+  file.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+  file.write(value.c_str(), name_len);
+}
+
+std::string PersistenceManager::read_string(std::ifstream &file) {
+  uint16_t name_len = 0;
+  file.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+  std::string value(name_len, '\0');
+  if (name_len > 0) {
+    file.read(&value[0], name_len);
+  }
+  return value;
 }
 
 }  // namespace db

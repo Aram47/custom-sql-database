@@ -14,6 +14,10 @@ TEST(ProtocolTest, ParseRequestValid) {
   auto p = Protocol::parse_request("PING|\n");
   EXPECT_EQ(p.type, "PING");
   EXPECT_EQ(p.data, "");
+
+  auto a = Protocol::parse_request("AUTH|admin|secret\n");
+  EXPECT_EQ(a.type, "AUTH");
+  EXPECT_EQ(a.data, "admin|secret");
 }
 
 TEST(ProtocolTest, ParseRequestInvalidThrows) {

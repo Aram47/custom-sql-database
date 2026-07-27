@@ -3,10 +3,13 @@
 #include <algorithm>
 
 #include "core/database.h"
+#include "core/session_context.h"
 #include "executor/group_aggregate_operator.h"
+#include "executor/index_predicate.h"
 #include "executor/select_analysis.h"
 #include "executor/select_expression_evaluator.h"
 #include "executor/select_pipeline.h"
+#include "planner/join_order_planner.h"
 
 namespace db {
 
@@ -123,9 +126,52 @@ QueryResult JoinSelectExecutor::execute() {
     aliases.push_back(join_alias);
   }
 
+  bool all_inner_or_cross = true;
+  for (const auto &tup : stmt_->get_joins()) {
+    const std::string &join_type = std::get<0>(tup);
+    if (join_type != "INNER" && join_type != "CROSS") {
+      all_inner_or_cross = false;
+      break;
+    }
+  }
+  if (all_inner_or_cross && ordered_tables.size() == 2) {
+    std::vector<JoinRelation> relations(2);
+    relations[0].table_name = ordered_tables[0]->get_name();
+    relations[0].estimated_rows = ordered_tables[0]->get_row_count();
+    relations[1].table_name = ordered_tables[1]->get_name();
+    relations[1].estimated_rows = ordered_tables[1]->get_row_count();
+    const ExpressionPtr &on_expr = std::get<3>(stmt_->get_joins()[0]);
+    std::string left_table;
+    std::string left_column;
+    std::string right_table;
+    std::string right_column;
+    if (on_expr && try_extract_equi_join_columns(on_expr, left_table,
+                                                 left_column, right_table,
+                                                 right_column)) {
+      relations[1].has_indexed_equi_join =
+          ordered_tables[1]->has_index(right_column) ||
+          ordered_tables[1]->has_index(left_column);
+      relations[0].has_indexed_equi_join =
+          ordered_tables[0]->has_index(right_column) ||
+          ordered_tables[0]->has_index(left_column);
+    }
+    const std::vector<size_t> order =
+        JoinOrderPlanner::planLeftDeepOrder(relations);
+    if (order.size() == 2 && order[0] == 1) {
+      std::swap(ordered_tables[0], ordered_tables[1]);
+      std::swap(aliases[0], aliases[1]);
+      from_tbl = ordered_tables[0];
+    }
+  }
+
   const std::vector<SelectColumnBinding> full_bindings =
       build_bindings_for_tables(ordered_tables, aliases);
-  const SelectExpressionEvaluator full_eval(full_bindings);
+  SelectExpressionEvaluator full_eval(full_bindings);
+  if (database_) {
+    full_eval.set_correlation_context(database_->get_correlation_context());
+    full_eval.set_bind_context(database_->get_active_bind());
+  }
+  bind_subquery_evaluators(full_eval, database_);
 
   /* Per-join ON: only columns visible at that join edge. */
   for (size_t ji = 1; ji < ordered_tables.size(); ++ji) {
@@ -157,12 +203,23 @@ QueryResult JoinSelectExecutor::execute() {
 
   /* --- Nested-loop join --- */
   std::vector<std::vector<Value>> current;
-  for (const auto &r : from_tbl->get_all_rows()) {
+  SessionContext *session =
+      database_ ? database_->get_active_session() : nullptr;
+  const auto load_visible = [&](Table *tbl) {
+    if (!database_) {
+      return tbl->get_all_rows();
+    }
+    return tbl->get_visible_rows(database_->get_transaction_manager(),
+                                 database_->get_reader_xid(session),
+                                 database_->get_reader_snapshot(session));
+  };
+  for (const auto &r : load_visible(from_tbl)) {
     current.push_back(row_values(r));
   }
 
   for (size_t ji = 1; ji < ordered_tables.size(); ++ji) {
     Table *rhs = ordered_tables[ji];
+    const std::vector<Row> rhs_rows = load_visible(rhs);
     const size_t bindings_through =
         cumulative_columns(ordered_tables, ji);
     std::vector<SelectColumnBinding> edge_bindings(
@@ -183,37 +240,172 @@ QueryResult JoinSelectExecutor::execute() {
 
     if (cartesian) {
       for (const auto &left_row : current) {
-        for (const auto &rr : rhs->get_all_rows()) {
+        for (const auto &rr : rhs_rows) {
           next.push_back(concat_vectors(left_row, row_values(rr)));
         }
       }
     } else if (join_type == "INNER") {
-      for (const auto &left_row : current) {
-        for (const auto &rr : rhs->get_all_rows()) {
-          std::vector<Value> comb = concat_vectors(left_row, row_values(rr));
-          Row jr(comb);
-          if (on_eval.evaluate_condition(jr, on_expr)) {
-            next.push_back(std::move(comb));
+      std::string left_table;
+      std::string left_column;
+      std::string right_table;
+      std::string right_column;
+      const bool is_equi =
+          on_expr && try_extract_equi_join_columns(on_expr, left_table,
+                                                   left_column, right_table,
+                                                   right_column);
+      const std::string &rhs_alias = aliases[ji];
+      const std::string &lhs_alias = aliases[ji - 1];
+      int rhs_col_idx = -1;
+      int lhs_col_in_combined = -1;
+      bool use_rhs_index = false;
+      if (is_equi) {
+        const bool right_is_rhs =
+            (right_table.empty() || right_table == rhs->get_name() ||
+             right_table == rhs_alias) &&
+            rhs->get_column_index(right_column) >= 0;
+        const bool left_is_rhs =
+            (left_table.empty() || left_table == rhs->get_name() ||
+             left_table == rhs_alias) &&
+            rhs->get_column_index(left_column) >= 0;
+        if (right_is_rhs && rhs->has_index(right_column)) {
+          rhs_col_idx = rhs->get_column_index(right_column);
+          const std::string probe_col = left_column;
+          for (size_t bi = 0; bi < edge_bindings.size(); ++bi) {
+            if (edge_bindings[bi].column_name == probe_col &&
+                (left_table.empty() ||
+                 edge_bindings[bi].alias == left_table ||
+                 edge_bindings[bi].physical_table == left_table ||
+                 edge_bindings[bi].alias == lhs_alias)) {
+              lhs_col_in_combined = static_cast<int>(bi);
+              break;
+            }
+          }
+          if (lhs_col_in_combined < 0) {
+            for (size_t bi = 0; bi < edge_bindings.size(); ++bi) {
+              if (edge_bindings[bi].column_name == probe_col) {
+                lhs_col_in_combined = static_cast<int>(bi);
+                break;
+              }
+            }
+          }
+          use_rhs_index = lhs_col_in_combined >= 0 && rhs_col_idx >= 0;
+          if (use_rhs_index) {
+            (void)rhs_col_idx;
+          }
+        } else if (left_is_rhs && rhs->has_index(left_column)) {
+          rhs_col_idx = rhs->get_column_index(left_column);
+          const std::string probe_col = right_column;
+          for (size_t bi = 0; bi < edge_bindings.size(); ++bi) {
+            if (edge_bindings[bi].column_name == probe_col) {
+              lhs_col_in_combined = static_cast<int>(bi);
+              break;
+            }
+          }
+          use_rhs_index = lhs_col_in_combined >= 0 && rhs_col_idx >= 0;
+        }
+      }
+      if (use_rhs_index) {
+        const std::string indexed_col =
+            rhs->get_column(static_cast<size_t>(rhs_col_idx)).get_name();
+        for (const auto &left_row : current) {
+          const Value &key =
+              left_row[static_cast<size_t>(lhs_col_in_combined)];
+          for (size_t ri : rhs->find_rows_by_value(indexed_col, key)) {
+            std::vector<Value> comb =
+                concat_vectors(left_row, row_values(rhs->get_row(ri)));
+            Row jr(comb);
+            if (on_eval.evaluate_condition(jr, on_expr)) {
+              next.push_back(std::move(comb));
+            }
+          }
+        }
+      } else {
+        for (const auto &left_row : current) {
+          for (const auto &rr : rhs_rows) {
+            std::vector<Value> comb = concat_vectors(left_row, row_values(rr));
+            Row jr(comb);
+            if (on_eval.evaluate_condition(jr, on_expr)) {
+              next.push_back(std::move(comb));
+            }
           }
         }
       }
     } else if (join_type == "LEFT") {
-      for (const auto &left_row : current) {
-        bool matched = false;
-        for (const auto &rr : rhs->get_all_rows()) {
-          std::vector<Value> comb = concat_vectors(left_row, row_values(rr));
-          Row jr(comb);
-          if (on_eval.evaluate_condition(jr, on_expr)) {
-            next.push_back(std::move(comb));
-            matched = true;
+      std::string left_table;
+      std::string left_column;
+      std::string right_table;
+      std::string right_column;
+      const bool is_equi =
+          on_expr && try_extract_equi_join_columns(on_expr, left_table,
+                                                   left_column, right_table,
+                                                   right_column);
+      int rhs_col_idx = -1;
+      int lhs_col_in_combined = -1;
+      bool use_rhs_index = false;
+      if (is_equi) {
+        const std::string &rhs_alias = aliases[ji];
+        if ((right_table.empty() || right_table == rhs->get_name() ||
+             right_table == rhs_alias) &&
+            rhs->has_index(right_column)) {
+          rhs_col_idx = rhs->get_column_index(right_column);
+          for (size_t bi = 0; bi < edge_bindings.size(); ++bi) {
+            if (edge_bindings[bi].column_name == left_column) {
+              lhs_col_in_combined = static_cast<int>(bi);
+              break;
+            }
+          }
+          use_rhs_index = lhs_col_in_combined >= 0;
+        } else if ((left_table.empty() || left_table == rhs->get_name() ||
+                    left_table == rhs_alias) &&
+                   rhs->has_index(left_column)) {
+          rhs_col_idx = rhs->get_column_index(left_column);
+          for (size_t bi = 0; bi < edge_bindings.size(); ++bi) {
+            if (edge_bindings[bi].column_name == right_column) {
+              lhs_col_in_combined = static_cast<int>(bi);
+              break;
+            }
+          }
+          use_rhs_index = lhs_col_in_combined >= 0;
+        }
+      }
+      if (use_rhs_index) {
+        const std::string indexed_col =
+            rhs->get_column(static_cast<size_t>(rhs_col_idx)).get_name();
+        for (const auto &left_row : current) {
+          bool matched = false;
+          const Value &key =
+              left_row[static_cast<size_t>(lhs_col_in_combined)];
+          for (size_t ri : rhs->find_rows_by_value(indexed_col, key)) {
+            std::vector<Value> comb =
+                concat_vectors(left_row, row_values(rhs->get_row(ri)));
+            Row jr(comb);
+            if (on_eval.evaluate_condition(jr, on_expr)) {
+              next.push_back(std::move(comb));
+              matched = true;
+            }
+          }
+          if (!matched) {
+            next.push_back(concat_vectors(left_row, null_vector(rw)));
           }
         }
-        if (!matched) {
-          next.push_back(concat_vectors(left_row, null_vector(rw)));
+      } else {
+        for (const auto &left_row : current) {
+          bool matched = false;
+          for (const auto &rr : rhs_rows) {
+            std::vector<Value> comb = concat_vectors(left_row, row_values(rr));
+            Row jr(comb);
+            if (on_eval.evaluate_condition(jr, on_expr)) {
+              next.push_back(std::move(comb));
+              matched = true;
+            }
+          }
+          if (!matched) {
+            next.push_back(concat_vectors(left_row, null_vector(rw)));
+          }
         }
       }
     } else if (join_type == "RIGHT") {
-      for (const auto &rr : rhs->get_all_rows()) {
+      for (const auto &rr : rhs_rows) {
         std::vector<Value> rv = row_values(rr);
         bool matched = false;
         for (const auto &left_row : current) {
@@ -229,7 +421,6 @@ QueryResult JoinSelectExecutor::execute() {
         }
       }
     } else if (join_type == "FULL") {
-      const auto rhs_rows = rhs->get_all_rows();
       std::vector<char> rhs_matched(rhs_rows.size(), 0);
       for (const auto &left_row : current) {
         bool left_matched = false;

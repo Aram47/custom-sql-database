@@ -39,6 +39,12 @@ std::string ColumnRefExpression::to_string() const {
   return table_name_ + "." + column_name_;
 }
 
+ParameterExpression::ParameterExpression(size_t index) : index_(index) {}
+
+size_t ParameterExpression::get_index() const { return index_; }
+
+std::string ParameterExpression::to_string() const { return "?"; }
+
 BinaryOpExpression::BinaryOpExpression(ExpressionPtr left, Operator op,
                                        ExpressionPtr right)
     : left_(left), right_(right), op_(op) {}
@@ -200,6 +206,10 @@ void SelectStatement::add_join(const std::string &type,
                                const std::string &alias,
                                ExpressionPtr condition) {
   joins_.push_back({type, table, alias, condition});
+}
+
+void SelectStatement::set_join_table(size_t index, const std::string &table) {
+  std::get<1>(joins_.at(index)) = table;
 }
 
 void SelectStatement::set_distinct(bool distinct) { distinct_ = distinct; }
@@ -441,12 +451,68 @@ bool ColumnDefinition::is_primary_key() const { return primary_key_; }
 
 bool ColumnDefinition::is_unique() const { return unique_; }
 
+void ColumnDefinition::set_default_value(const Value &value) {
+  default_value_ = value;
+}
+
+bool ColumnDefinition::has_default() const { return default_value_.has_value(); }
+
+const Value &ColumnDefinition::get_default_value() const {
+  return *default_value_;
+}
+
+void ColumnDefinition::set_references(const std::string &parent_table,
+                                      const std::string &parent_column,
+                                      ReferentialAction on_delete,
+                                      ReferentialAction on_update) {
+  references_table_ = parent_table;
+  references_column_ = parent_column;
+  on_delete_ = on_delete;
+  on_update_ = on_update;
+}
+
+bool ColumnDefinition::has_references() const {
+  return !references_table_.empty();
+}
+
+const std::string &ColumnDefinition::get_references_table() const {
+  return references_table_;
+}
+
+const std::string &ColumnDefinition::get_references_column() const {
+  return references_column_;
+}
+
+ReferentialAction ColumnDefinition::get_on_delete() const { return on_delete_; }
+
+ReferentialAction ColumnDefinition::get_on_update() const { return on_update_; }
+
+void ColumnDefinition::set_check_expression(ExpressionPtr expr) {
+  check_expression_ = std::move(expr);
+}
+
+bool ColumnDefinition::has_check_expression() const {
+  return check_expression_ != nullptr;
+}
+
+const ExpressionPtr &ColumnDefinition::get_check_expression() const {
+  return check_expression_;
+}
+
 std::string ColumnDefinition::to_string() const {
   std::ostringstream oss;
   oss << name_ << " " << type_;
   if (not_null_) oss << " NOT NULL";
   if (primary_key_) oss << " PRIMARY KEY";
   if (unique_) oss << " UNIQUE";
+  if (has_default()) oss << " DEFAULT " << default_value_->to_string();
+  if (has_references()) {
+    oss << " REFERENCES " << references_table_ << "(" << references_column_
+        << ")";
+  }
+  if (has_check_expression()) {
+    oss << " CHECK (" << check_expression_->to_string() << ")";
+  }
   return oss.str();
 }
 
@@ -463,8 +529,26 @@ void CreateTableStatement::add_column(const ColumnDefinition &col) {
   columns_.push_back(col);
 }
 
+void CreateTableStatement::add_foreign_key(const ForeignKeyDefinition &fk) {
+  foreign_keys_.push_back(fk);
+}
+
+void CreateTableStatement::add_check(const CheckConstraintDefinition &check) {
+  checks_.push_back(check);
+}
+
 const std::vector<ColumnDefinition> &CreateTableStatement::get_columns() const {
   return columns_;
+}
+
+const std::vector<ForeignKeyDefinition> &
+CreateTableStatement::get_foreign_keys() const {
+  return foreign_keys_;
+}
+
+const std::vector<CheckConstraintDefinition> &
+CreateTableStatement::get_checks() const {
+  return checks_;
 }
 
 std::string CreateTableStatement::to_string() const {
@@ -474,8 +558,268 @@ std::string CreateTableStatement::to_string() const {
     if (i > 0) oss << ", ";
     oss << columns_[i].to_string();
   }
+  for (const auto &fk : foreign_keys_) {
+    oss << ", FOREIGN KEY (";
+    for (size_t i = 0; i < fk.child_columns.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << fk.child_columns[i];
+    }
+    oss << ") REFERENCES " << fk.parent_table << "(";
+    for (size_t i = 0; i < fk.parent_columns.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << fk.parent_columns[i];
+    }
+    oss << ")";
+  }
+  for (const auto &check : checks_) {
+    oss << ", ";
+    if (!check.name.empty()) {
+      oss << "CONSTRAINT " << check.name << " ";
+    }
+    oss << "CHECK (" << check.expression_text << ")";
+  }
   oss << ")";
   return oss.str();
+}
+
+DropTableStatement::DropTableStatement(const std::string &table)
+    : table_name_(table) {}
+
+const std::string &DropTableStatement::get_table_name() const {
+  return table_name_;
+}
+
+std::string DropTableStatement::to_string() const {
+  return "DROP TABLE " + table_name_;
+}
+
+AlterTableStatement::AlterTableStatement(const std::string &table)
+    : table_name_(table) {}
+
+const std::string &AlterTableStatement::get_table_name() const {
+  return table_name_;
+}
+
+void AlterTableStatement::set_action(const AlterTableAction &action) {
+  action_ = action;
+}
+
+const AlterTableAction &AlterTableStatement::get_action() const {
+  return action_;
+}
+
+std::string AlterTableStatement::to_string() const {
+  return "ALTER TABLE " + table_name_;
+}
+
+CreateIndexStatement::CreateIndexStatement(
+    const std::string &index_name, const std::string &table_name,
+    std::vector<std::string> column_names)
+    : index_name_(index_name),
+      table_name_(table_name),
+      column_names_(std::move(column_names)) {}
+
+const std::string &CreateIndexStatement::get_index_name() const {
+  return index_name_;
+}
+
+const std::string &CreateIndexStatement::get_table_name() const {
+  return table_name_;
+}
+
+const std::vector<std::string> &CreateIndexStatement::get_column_names() const {
+  return column_names_;
+}
+
+std::string CreateIndexStatement::to_string() const {
+  std::string columns;
+  for (size_t i = 0; i < column_names_.size(); ++i) {
+    if (i > 0) {
+      columns += ", ";
+    }
+    columns += column_names_[i];
+  }
+  return "CREATE INDEX " + index_name_ + " ON " + table_name_ + "(" + columns +
+         ")";
+}
+
+DropIndexStatement::DropIndexStatement(const std::string &index_name)
+    : index_name_(index_name) {}
+
+const std::string &DropIndexStatement::get_index_name() const {
+  return index_name_;
+}
+
+std::string DropIndexStatement::to_string() const {
+  return "DROP INDEX " + index_name_;
+}
+
+CreateViewStatement::CreateViewStatement(
+    const std::string &view_name, const std::string &select_sql,
+    std::shared_ptr<SelectStatement> select)
+    : view_name_(view_name),
+      select_sql_(select_sql),
+      select_(std::move(select)) {}
+
+const std::string &CreateViewStatement::get_view_name() const {
+  return view_name_;
+}
+
+const std::string &CreateViewStatement::get_select_sql() const {
+  return select_sql_;
+}
+
+const std::shared_ptr<SelectStatement> &CreateViewStatement::get_select()
+    const {
+  return select_;
+}
+
+std::string CreateViewStatement::to_string() const {
+  return "CREATE VIEW " + view_name_ + " AS " + select_sql_;
+}
+
+DropViewStatement::DropViewStatement(const std::string &view_name,
+                                     bool if_exists)
+    : view_name_(view_name), if_exists_(if_exists) {}
+
+const std::string &DropViewStatement::get_view_name() const {
+  return view_name_;
+}
+
+bool DropViewStatement::is_if_exists() const { return if_exists_; }
+
+std::string DropViewStatement::to_string() const {
+  if (if_exists_) {
+    return "DROP VIEW IF EXISTS " + view_name_;
+  }
+  return "DROP VIEW " + view_name_;
+}
+
+std::string BeginStatement::to_string() const { return "BEGIN"; }
+
+std::string CommitStatement::to_string() const { return "COMMIT"; }
+
+std::string RollbackStatement::to_string() const { return "ROLLBACK"; }
+
+PrepareStatement::PrepareStatement(const std::string &name,
+                                   const std::string &sql)
+    : name_(name), sql_(sql) {}
+
+const std::string &PrepareStatement::get_name() const { return name_; }
+
+const std::string &PrepareStatement::get_sql() const { return sql_; }
+
+std::string PrepareStatement::to_string() const {
+  return "PREPARE " + name_ + " AS " + sql_;
+}
+
+ExecutePreparedStatement::ExecutePreparedStatement(
+    const std::string &name, std::vector<Value> arguments)
+    : name_(name), arguments_(std::move(arguments)) {}
+
+const std::string &ExecutePreparedStatement::get_name() const { return name_; }
+
+const std::vector<Value> &ExecutePreparedStatement::get_arguments() const {
+  return arguments_;
+}
+
+std::string ExecutePreparedStatement::to_string() const {
+  return "EXECUTE " + name_;
+}
+
+DeallocatePreparedStatement::DeallocatePreparedStatement(
+    const std::string &name)
+    : name_(name) {}
+
+const std::string &DeallocatePreparedStatement::get_name() const {
+  return name_;
+}
+
+std::string DeallocatePreparedStatement::to_string() const {
+  return "DEALLOCATE PREPARE " + name_;
+}
+
+VacuumStatement::VacuumStatement(const std::string &table_name)
+    : table_name_(table_name) {}
+
+const std::string &VacuumStatement::get_table_name() const {
+  return table_name_;
+}
+
+std::string VacuumStatement::to_string() const {
+  if (table_name_.empty()) {
+    return "VACUUM";
+  }
+  return "VACUUM " + table_name_;
+}
+
+InExpression::InExpression(ExpressionPtr left, ExpressionPtr subquery,
+                           bool is_not)
+    : left_(std::move(left)),
+      subquery_(std::move(subquery)),
+      is_not_(is_not) {}
+
+InExpression::InExpression(ExpressionPtr left,
+                           std::vector<ExpressionPtr> values, bool is_not)
+    : left_(std::move(left)),
+      values_(std::move(values)),
+      is_not_(is_not) {}
+
+const ExpressionPtr &InExpression::get_left() const { return left_; }
+
+bool InExpression::is_not() const { return is_not_; }
+
+bool InExpression::has_subquery() const { return subquery_ != nullptr; }
+
+const ExpressionPtr &InExpression::get_subquery() const { return subquery_; }
+
+const std::vector<ExpressionPtr> &InExpression::get_values() const {
+  return values_;
+}
+
+std::string InExpression::to_string() const {
+  std::string result = left_->to_string();
+  result += is_not_ ? " NOT IN (" : " IN (";
+  if (subquery_) {
+    result += subquery_->to_string();
+  } else {
+    for (size_t i = 0; i < values_.size(); ++i) {
+      if (i > 0) {
+        result += ", ";
+      }
+      result += values_[i]->to_string();
+    }
+  }
+  result += ")";
+  return result;
+}
+
+ExistsExpression::ExistsExpression(std::shared_ptr<SelectStatement> select,
+                                   bool is_not)
+    : select_(std::move(select)), is_not_(is_not) {}
+
+const std::shared_ptr<SelectStatement> &ExistsExpression::get_select() const {
+  return select_;
+}
+
+bool ExistsExpression::is_not() const { return is_not_; }
+
+std::string ExistsExpression::to_string() const {
+  return std::string(is_not_ ? "NOT EXISTS (" : "EXISTS (") +
+         select_->to_string() + ")";
+}
+
+SubqueryExpression::SubqueryExpression(
+    std::shared_ptr<SelectStatement> select)
+    : select_(std::move(select)) {}
+
+const std::shared_ptr<SelectStatement> &SubqueryExpression::get_select()
+    const {
+  return select_;
+}
+
+std::string SubqueryExpression::to_string() const {
+  return "(" + select_->to_string() + ")";
 }
 
 }  // namespace db
