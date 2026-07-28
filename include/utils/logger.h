@@ -8,7 +8,8 @@
 
 namespace db {
 
-enum class LogLevel { DEBUG, INFO, WARNING, ERROR };
+// PascalCase enumerators avoid Win32 macros (e.g. ERROR from windows.h).
+enum class LogLevel { Debug, Info, Warning, Error };
 
 class Logger {
  public:
@@ -21,26 +22,26 @@ class Logger {
 
   template <typename... Args>
   void debug(const Args &...args) {
-    if (current_level_ <= LogLevel::DEBUG) log(LogLevel::DEBUG, args...);
+    if (current_level_ <= LogLevel::Debug) log(LogLevel::Debug, args...);
   }
 
   template <typename... Args>
   void info(const Args &...args) {
-    if (current_level_ <= LogLevel::INFO) log(LogLevel::INFO, args...);
+    if (current_level_ <= LogLevel::Info) log(LogLevel::Info, args...);
   }
 
   template <typename... Args>
   void warning(const Args &...args) {
-    if (current_level_ <= LogLevel::WARNING) log(LogLevel::WARNING, args...);
+    if (current_level_ <= LogLevel::Warning) log(LogLevel::Warning, args...);
   }
 
   template <typename... Args>
   void error(const Args &...args) {
-    if (current_level_ <= LogLevel::ERROR) log(LogLevel::ERROR, args...);
+    if (current_level_ <= LogLevel::Error) log(LogLevel::Error, args...);
   }
 
  private:
-  LogLevel current_level_ = LogLevel::INFO;
+  LogLevel current_level_ = LogLevel::Info;
 
   Logger() = default;
 
@@ -54,13 +55,13 @@ class Logger {
 
   std::string get_level_string(LogLevel level) const {
     switch (level) {
-      case LogLevel::DEBUG:
+      case LogLevel::Debug:
         return "DEBUG";
-      case LogLevel::INFO:
+      case LogLevel::Info:
         return "INFO";
-      case LogLevel::WARNING:
+      case LogLevel::Warning:
         return "WARN";
-      case LogLevel::ERROR:
+      case LogLevel::Error:
         return "ERROR";
       default:
         return "UNKNOWN";

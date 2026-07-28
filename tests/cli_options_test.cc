@@ -35,7 +35,7 @@ TEST(CliOptionsTest, ParsesAllFlags) {
   EXPECT_EQ(opts->port, 9100);
   EXPECT_EQ(opts->workers, 8u);
   EXPECT_EQ(opts->data_directory, "/tmp/db");
-  EXPECT_EQ(opts->log_level, LogLevel::DEBUG);
+  EXPECT_EQ(opts->log_level, LogLevel::Debug);
 }
 
 TEST(CliOptionsTest, ParsesAuthFlags) {

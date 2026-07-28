@@ -41,19 +41,19 @@ bool parse_log_level(const std::string &text, LogLevel &out_level) {
     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   }
   if (upper == "DEBUG") {
-    out_level = LogLevel::DEBUG;
+    out_level = LogLevel::Debug;
     return true;
   }
   if (upper == "INFO") {
-    out_level = LogLevel::INFO;
+    out_level = LogLevel::Info;
     return true;
   }
   if (upper == "WARNING" || upper == "WARN") {
-    out_level = LogLevel::WARNING;
+    out_level = LogLevel::Warning;
     return true;
   }
   if (upper == "ERROR") {
-    out_level = LogLevel::ERROR;
+    out_level = LogLevel::Error;
     return true;
   }
   return false;

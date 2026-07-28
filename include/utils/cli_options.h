@@ -13,7 +13,7 @@ struct CliOptions {
   int port{9000};
   size_t workers{4};
   std::string data_directory{"data"};
-  LogLevel log_level{LogLevel::INFO};
+  LogLevel log_level{LogLevel::Info};
   bool show_help{false};
   std::optional<std::string> auth_file;
   /** Tri-state: nullopt = default (true when auth_file set). */
