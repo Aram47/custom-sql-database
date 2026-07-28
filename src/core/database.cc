@@ -10,13 +10,27 @@
 #include "core/authorization.h"
 #include "core/index_key.h"
 #include "core/check_constraint.h"
+#include "core/partition_catalog.h"
 #include "core/view_expander.h"
 #include "executor/ddl_executor.h"
 #include "executor/join_select_executor.h"
+#include "executor/limit_offset_operator.h"
+#include "executor/partition_prune.h"
+#include "executor/procedure_executor.h"
 #include "executor/query_executor.h"
+#include "executor/scalar_function.h"
+#include "executor/select_analysis.h"
+#include "executor/select_column_binding.h"
+#include "executor/select_expression_evaluator.h"
+#include "executor/select_pipeline.h"
+#include "executor/set_operation_operator.h"
+#include "executor/sort_operator.h"
+#include "executor/trigger_executor.h"
 #include "parser/parser.h"
 #include "planner/query_explainer.h"
 #include "storage/persistence_manager.h"
+#include "storage/page_store.h"
+#include "types/data_type.h"
 #include "utils/logger.h"
 
 namespace fs = std::filesystem;
@@ -48,13 +62,27 @@ bool is_statement_authorized(Role role, const ParsedStatement &stmt,
 }  // namespace
 
 Database::Database(std::string storage_directory, int vacuum_interval_ms)
+    : Database(std::move(storage_directory), vacuum_interval_ms, 64) {}
+
+Database::Database(std::string storage_directory, int vacuum_interval_ms,
+                   size_t buffer_pool_pages)
     : storage_directory_(std::move(storage_directory)),
+      buffer_pool_pages_(buffer_pool_pages == 0 ? 64 : buffer_pool_pages),
+      buffer_pool_(std::make_unique<BufferPool>(buffer_pool_pages_)),
       wal_manager_(storage_directory_),
       vacuum_interval_ms_(vacuum_interval_ms) {
   start_vacuum_worker();
 }
 
-Database::~Database() { stop_vacuum_worker(); }
+Database::~Database() {
+  stop_vacuum_worker();
+  try {
+    if (buffer_pool_) {
+      buffer_pool_->flush_all();
+    }
+  } catch (...) {
+  }
+}
 
 void Database::set_vacuum_interval_ms(int vacuum_interval_ms) {
   vacuum_interval_ms_.store(vacuum_interval_ms);
@@ -131,6 +159,26 @@ const TransactionSnapshot *Database::get_reader_snapshot(
 
 SessionContext *Database::get_active_session() const { return active_session_; }
 
+TableStatistics &Database::get_table_statistics() { return table_statistics_; }
+
+const TableStatistics &Database::get_table_statistics() const {
+  return table_statistics_;
+}
+
+void Database::ensureTableStatistics(const std::string &table_name) {
+  Table *table = get_table(table_name);
+  if (!table) {
+    return;
+  }
+  const bool missing = !table_statistics_.hasTable(table_name);
+  const bool stale =
+      !missing &&
+      table_statistics_.getRowCount(table_name) != table->get_row_count();
+  if (missing || stale) {
+    table_statistics_.refreshTable(*table);
+  }
+}
+
 void Database::load_from_disk() {
   std::lock_guard<std::recursive_mutex> lock(db_mutex_);
   try {
@@ -141,6 +189,9 @@ void Database::load_from_disk() {
       table->clear_dirty();
     }
     view_catalog_.load_all(storage_directory_);
+    routine_catalog_.loadAll(storage_directory_);
+    trigger_catalog_.loadAll(storage_directory_);
+    PartitionCatalog::loadAll(storage_directory_, tables_);
   } catch (const StorageException &e) {
     DB_LOG_ERROR("Failed to load database from disk: ", e.what());
     throw;
@@ -153,6 +204,7 @@ void Database::vacuum_all_tables() {
   for (auto &[name, table] : tables_) {
     (void)name;
     table->vacuum_versions(transaction_manager_);
+    table_statistics_.refreshTable(*table);
   }
 }
 
@@ -192,6 +244,49 @@ void Database::release_session_locks(SessionContext *session) {
   lock_manager_.release_all(session->get_transaction_id());
 }
 
+void Database::flush_dirty_tables_locked() {
+  std::vector<std::pair<std::string, std::string>> staged;
+  for (auto &[name, table] : tables_) {
+    if (!table->is_dirty()) {
+      continue;
+    }
+    const std::string temp_path =
+        storage_directory_ + "/.wal_stage_" + name + ".db";
+    PersistenceManager::save_table(*table, temp_path);
+    staged.emplace_back(name, temp_path);
+  }
+  if (staged.empty()) {
+    if (buffer_pool_) {
+      buffer_pool_->flush_all();
+    }
+    return;
+  }
+  for (const auto &[name, temp_path] : staged) {
+    wal_manager_.append_table_blob(name, read_file_bytes(temp_path));
+  }
+  wal_manager_.append_commit(0);
+  wal_manager_.sync();
+  for (const auto &[name, temp_path] : staged) {
+    const std::string dest =
+        PersistenceManager::table_file_path(storage_directory_, name);
+    fs::rename(temp_path, dest);
+    tables_[name]->clear_dirty();
+    if (tables_[name]->isPartitioned()) {
+      PartitionCatalog::saveParent(storage_directory_, name,
+                                   *tables_[name]->getPartitionMetadata());
+    }
+  }
+  if (buffer_pool_) {
+    buffer_pool_->flush_all();
+  }
+  wal_manager_.truncate();
+}
+
+void Database::checkpoint() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  flush_dirty_tables_locked();
+}
+
 QueryResult Database::persist_dirty_tables(QueryResult result,
                                            bool in_transaction) {
   if (!result.success) {
@@ -202,31 +297,7 @@ QueryResult Database::persist_dirty_tables(QueryResult result,
   }
   std::lock_guard<std::recursive_mutex> lock(db_mutex_);
   try {
-    std::vector<std::pair<std::string, std::string>> staged;
-    for (auto &[name, table] : tables_) {
-      if (!table->is_dirty()) {
-        continue;
-      }
-      const std::string temp_path =
-          storage_directory_ + "/.wal_stage_" + name + ".db";
-      PersistenceManager::save_table(*table, temp_path);
-      staged.emplace_back(name, temp_path);
-    }
-    if (staged.empty()) {
-      return result;
-    }
-    for (const auto &[name, temp_path] : staged) {
-      wal_manager_.append_table_blob(name, read_file_bytes(temp_path));
-    }
-    wal_manager_.append_commit(0);
-    wal_manager_.sync();
-    for (const auto &[name, temp_path] : staged) {
-      const std::string dest =
-          PersistenceManager::table_file_path(storage_directory_, name);
-      fs::rename(temp_path, dest);
-      tables_[name]->clear_dirty();
-    }
-    wal_manager_.truncate();
+    flush_dirty_tables_locked();
     return result;
   } catch (const StorageException &e) {
     DB_LOG_ERROR("Persistence failed: ", e.what());
@@ -362,6 +433,11 @@ QueryResult Database::dispatch_statement(const ParsedStatement &stmt,
         [&]() { return execute_select_statement(*select_stmt); });
     return result;
   }
+  if (auto set_op_stmt =
+          std::get_if<std::shared_ptr<SetOperationStatement>>(&stmt)) {
+    return run_locked(
+        [&]() { return execute_set_operation_statement(*set_op_stmt); });
+  }
   if (auto insert_stmt = std::get_if<std::shared_ptr<InsertStatement>>(&stmt)) {
     acquire_table_lock(session, (*insert_stmt)->get_table(),
                        LockMode::Exclusive);
@@ -474,6 +550,49 @@ QueryResult Database::dispatch_statement(const ParsedStatement &stmt,
         run_locked([&]() { return execute_drop_view_statement(*drop_view); });
     return result;
   }
+  if (auto create_fn =
+          std::get_if<std::shared_ptr<CreateFunctionStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_create_function_statement(*create_fn); });
+  }
+  if (auto drop_fn =
+          std::get_if<std::shared_ptr<DropFunctionStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_drop_function_statement(*drop_fn); });
+  }
+  if (auto create_proc =
+          std::get_if<std::shared_ptr<CreateProcedureStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_create_procedure_statement(*create_proc); });
+  }
+  if (auto drop_proc =
+          std::get_if<std::shared_ptr<DropProcedureStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_drop_procedure_statement(*drop_proc); });
+  }
+  if (auto call_stmt = std::get_if<std::shared_ptr<CallStatement>>(&stmt)) {
+    return execute_call_statement(*call_stmt, session);
+  }
+  if (auto create_trig =
+          std::get_if<std::shared_ptr<CreateTriggerStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_create_trigger_statement(*create_trig); });
+  }
+  if (auto drop_trig =
+          std::get_if<std::shared_ptr<DropTriggerStatement>>(&stmt)) {
+    clear_plan_cache();
+    return run_locked(
+        [&]() { return execute_drop_trigger_statement(*drop_trig); });
+  }
+  if (std::holds_alternative<std::shared_ptr<SetNewStatement>>(stmt)) {
+    return QueryResult::error_result(
+        "SET NEW is only valid inside a BEFORE trigger body");
+  }
   return QueryResult::error_result("Unknown statement type");
 }
 
@@ -486,7 +605,9 @@ void Database::create_table(const std::string &table_name) {
     throw ConstraintException("Relation '" + table_name +
                               "' already exists as a view");
   }
-  tables_[table_name] = std::make_unique<Table>(table_name);
+  tables_[table_name] = std::make_unique<Table>(
+      table_name, Table::allocate_file_id(), *buffer_pool_,
+      std::make_unique<MemoryPageStore>());
   tables_[table_name]->mark_dirty();
 }
 
@@ -672,6 +793,54 @@ QueryResult Database::execute_select_statement(
   return executor.execute();
 }
 
+QueryResult Database::execute_query_operand(
+    const SetOperationStatement::Operand &operand) {
+  if (auto select = std::get_if<std::shared_ptr<SelectStatement>>(&operand)) {
+    return execute_select_statement(*select);
+  }
+  return execute_set_operation_statement(
+      std::get<std::shared_ptr<SetOperationStatement>>(operand));
+}
+
+QueryResult Database::execute_set_operation_statement(
+    std::shared_ptr<SetOperationStatement> stmt) {
+  if (!stmt) {
+    return QueryResult::error_result("Empty set operation");
+  }
+  QueryResult leftResult = execute_query_operand(stmt->get_left());
+  if (!leftResult.success) {
+    return leftResult;
+  }
+  QueryResult rightResult = execute_query_operand(stmt->get_right());
+  if (!rightResult.success) {
+    return rightResult;
+  }
+  SetOperationOperator setOp;
+  QueryResult combined = setOp.execute(leftResult, rightResult, stmt->get_kind(),
+                                       stmt->is_all());
+  if (!combined.success) {
+    return combined;
+  }
+  if (stmt->get_order_by_columns().empty() && stmt->get_limit() <= 0 &&
+      stmt->get_offset() <= 0) {
+    return combined;
+  }
+  auto orderStmt = std::make_shared<SelectStatement>();
+  for (const auto &[expr, ascending] : stmt->get_order_by_columns()) {
+    orderStmt->add_order_by_column(expr, ascending);
+  }
+  orderStmt->set_limit(stmt->get_limit());
+  orderStmt->set_offset(stmt->get_offset());
+  SelectPipelineContext ctx{orderStmt, evaluator_for_result_columns(combined)};
+  SortOperator sort;
+  combined = sort.apply(std::move(combined), ctx);
+  if (!combined.success) {
+    return combined;
+  }
+  LimitOffsetOperator limitOffset;
+  return limitOffset.apply(std::move(combined), ctx);
+}
+
 QueryResult Database::execute_insert_statement(
     std::shared_ptr<InsertStatement> stmt) {
   Table *table = get_table(stmt->get_table());
@@ -690,6 +859,9 @@ QueryResult Database::execute_update_statement(
     return QueryResult::error_result("Table '" + stmt->get_table() +
                                      "' not found");
   }
+  if (table->isPartitioned()) {
+    return execute_partitioned_update(stmt, table);
+  }
   UpdateExecutor executor(stmt, table, this);
   return executor.execute();
 }
@@ -700,6 +872,9 @@ QueryResult Database::execute_delete_statement(
   if (!table) {
     return QueryResult::error_result("Table '" + stmt->get_table() +
                                      "' not found");
+  }
+  if (table->isPartitioned()) {
+    return execute_partitioned_delete(stmt, table);
   }
   DeleteExecutor executor(stmt, table, this);
   return executor.execute();
@@ -911,8 +1086,10 @@ void Database::apply_referential_delete(const std::string &parent_table_name,
             "FOREIGN KEY RESTRICT: cannot delete referenced key");
       }
       if (fk.on_delete == ReferentialAction::SetNull) {
+        TriggerExecutor triggers(this, get_active_session());
         for (size_t idx : child_indices) {
-          Row child_row = child_ptr->get_row(idx);
+          Row old_child = child_ptr->get_row(idx);
+          Row child_row = old_child;
           for (const std::string &column_name : fk.child_columns) {
             const int child_col = child_ptr->get_column_index(column_name);
             if (child_col < 0) {
@@ -926,7 +1103,17 @@ void Database::apply_referential_delete(const std::string &parent_table_name,
             }
             child_row.set_value(static_cast<size_t>(child_col), Value());
           }
+          QueryResult before = triggers.executeBeforeUpdate(
+              child_name, old_child, child_row);
+          if (!before.success) {
+            throw InvalidOperationException(before.message);
+          }
           child_ptr->update_row(idx, child_row);
+          QueryResult after =
+              triggers.executeAfterUpdate(child_name, old_child, child_row);
+          if (!after.success) {
+            throw InvalidOperationException(after.message);
+          }
         }
         continue;
       }
@@ -938,13 +1125,24 @@ void Database::apply_referential_delete(const std::string &parent_table_name,
       }
       std::sort(child_indices.begin(), child_indices.end(),
                 std::greater<size_t>());
+      TriggerExecutor triggers(this, get_active_session());
       for (size_t idx : child_indices) {
         if (idx >= child_ptr->get_row_count()) {
           continue;
         }
         Row child_row = child_ptr->get_row(idx);
         apply_referential_delete(child_name, child_row, visiting);
+        QueryResult before =
+            triggers.executeBeforeDelete(child_name, child_row);
+        if (!before.success) {
+          throw InvalidOperationException(before.message);
+        }
         child_ptr->delete_row(idx);
+        QueryResult after =
+            triggers.executeAfterDelete(child_name, child_row);
+        if (!after.success) {
+          throw InvalidOperationException(after.message);
+        }
       }
     }
   }
@@ -1005,8 +1203,10 @@ void Database::apply_referential_update(const std::string &parent_table_name,
             "FOREIGN KEY RESTRICT: cannot update referenced key");
       }
       if (fk.on_update == ReferentialAction::SetNull) {
+        TriggerExecutor triggers(this, get_active_session());
         for (size_t idx : child_indices) {
-          Row child_row = child_ptr->get_row(idx);
+          Row old_child = child_ptr->get_row(idx);
+          Row child_row = old_child;
           for (const std::string &column_name : fk.child_columns) {
             const int child_col = child_ptr->get_column_index(column_name);
             if (child_col < 0) {
@@ -1020,7 +1220,17 @@ void Database::apply_referential_update(const std::string &parent_table_name,
             }
             child_row.set_value(static_cast<size_t>(child_col), Value());
           }
+          QueryResult before = triggers.executeBeforeUpdate(
+              child_name, old_child, child_row);
+          if (!before.success) {
+            throw InvalidOperationException(before.message);
+          }
           child_ptr->update_row(idx, child_row);
+          QueryResult after =
+              triggers.executeAfterUpdate(child_name, old_child, child_row);
+          if (!after.success) {
+            throw InvalidOperationException(after.message);
+          }
         }
         continue;
       }
@@ -1030,8 +1240,10 @@ void Database::apply_referential_update(const std::string &parent_table_name,
         }
         continue;
       }
+      TriggerExecutor triggers(this, get_active_session());
       for (size_t idx : child_indices) {
-        Row child_row = child_ptr->get_row(idx);
+        Row old_child = child_ptr->get_row(idx);
+        Row child_row = old_child;
         for (size_t c = 0; c < fk.child_columns.size(); ++c) {
           const int child_col =
               child_ptr->get_column_index(fk.child_columns[c]);
@@ -1039,7 +1251,17 @@ void Database::apply_referential_update(const std::string &parent_table_name,
             child_row.set_value(static_cast<size_t>(child_col), new_values[c]);
           }
         }
+        QueryResult before =
+            triggers.executeBeforeUpdate(child_name, old_child, child_row);
+        if (!before.success) {
+          throw InvalidOperationException(before.message);
+        }
         child_ptr->update_row(idx, child_row);
+        QueryResult after =
+            triggers.executeAfterUpdate(child_name, old_child, child_row);
+        if (!after.success) {
+          throw InvalidOperationException(after.message);
+        }
       }
     }
   }
@@ -1107,9 +1329,16 @@ void Database::register_checks_for_create(
 
 QueryResult Database::execute_create_table_statement(
     std::shared_ptr<CreateTableStatement> stmt) {
+  if (stmt->isPartitionOf()) {
+    return execute_create_partition_of(stmt);
+  }
   if (view_catalog_.has_view(stmt->get_table_name())) {
     return QueryResult::error_result("Relation '" + stmt->get_table_name() +
                                      "' already exists as a view");
+  }
+  if (stmt->hasPartitionBy() && !stmt->get_foreign_keys().empty()) {
+    return QueryResult::error_result(
+        "FOREIGN KEY is not supported on partitioned parent tables");
   }
   CreateTableExecutor executor(stmt, &tables_);
   QueryResult result = executor.execute();
@@ -1117,6 +1346,9 @@ QueryResult Database::execute_create_table_statement(
     try {
       register_foreign_keys_for_create(stmt);
       register_checks_for_create(stmt);
+      if (stmt->hasPartitionBy()) {
+        attachPartitionMetadata(get_table(stmt->get_table_name()), stmt);
+      }
     } catch (const std::exception &e) {
       tables_.erase(stmt->get_table_name());
       return QueryResult::error_result(e.what());
@@ -1126,14 +1358,350 @@ QueryResult Database::execute_create_table_statement(
     if (table) {
       table->rebuild_indexes();
     }
+    if (stmt->hasPartitionBy()) {
+      try {
+        persistPartitionMetadata(stmt->get_table_name());
+      } catch (const std::exception &e) {
+        return QueryResult::error_result(e.what());
+      }
+    }
   }
   return result;
 }
 
+void Database::attachPartitionMetadata(
+    Table *table, const std::shared_ptr<CreateTableStatement> &stmt) {
+  if (!table) {
+    throw ConstraintException("Internal error: missing table for PARTITION BY");
+  }
+  if (table->get_column_index(stmt->getPartitionKeyColumn()) < 0) {
+    throw ConstraintException("Partition key column '" +
+                              stmt->getPartitionKeyColumn() + "' not found");
+  }
+  table->setPartitionMetadata(std::make_unique<PartitionedTableMetadata>(
+      stmt->getPartitionKind(), stmt->getPartitionKeyColumn()));
+}
+
+void Database::persistPartitionMetadata(const std::string &parentName) {
+  Table *table = get_table(parentName);
+  if (!table || !table->isPartitioned()) {
+    return;
+  }
+  PartitionCatalog::saveParent(storage_directory_, parentName,
+                               *table->getPartitionMetadata());
+}
+
+QueryResult Database::execute_create_partition_of(
+    std::shared_ptr<CreateTableStatement> stmt) {
+  const std::string &childName = stmt->get_table_name();
+  const std::string &parentName = stmt->getPartitionOfParent();
+  if (tables_.count(childName) || view_catalog_.has_view(childName)) {
+    return QueryResult::error_result("Relation '" + childName +
+                                     "' already exists");
+  }
+  Table *parent = get_table(parentName);
+  if (!parent) {
+    return QueryResult::error_result("Parent table '" + parentName +
+                                     "' not found");
+  }
+  if (!parent->isPartitioned()) {
+    return QueryResult::error_result("Table '" + parentName +
+                                     "' is not partitioned");
+  }
+  if (!parent->get_foreign_keys().empty()) {
+    return QueryResult::error_result(
+        "FOREIGN KEY is not supported on partitioned parent tables");
+  }
+  PartitionedTableMetadata *meta = parent->getMutablePartitionMetadata();
+  const PartitionBound &bound = stmt->getPartitionBound();
+  if (meta->getKind() == PartitionKind::Range && !bound.range) {
+    return QueryResult::error_result(
+        "RANGE parent requires FOR VALUES FROM (...) TO (...)");
+  }
+  if (meta->getKind() == PartitionKind::Hash && !bound.hash) {
+    return QueryResult::error_result(
+        "HASH parent requires FOR VALUES WITH (MODULUS ..., REMAINDER ...)");
+  }
+  try {
+    auto child = std::make_unique<Table>(childName);
+    for (const Column &col : parent->get_columns()) {
+      child->add_column(col);
+    }
+    child->set_checks(parent->get_checks());
+    child->set_secondary_indexes(parent->get_secondary_indexes());
+    PartitionDescriptor descriptor;
+    descriptor.childTableName = childName;
+    descriptor.bound = bound;
+    std::string error;
+    if (!meta->addPartition(descriptor, &error)) {
+      return QueryResult::error_result(error);
+    }
+    tables_[childName] = std::move(child);
+    tables_[childName]->rebuild_indexes();
+    mark_table_dirty(childName);
+    mark_table_dirty(parentName);
+    persistPartitionMetadata(parentName);
+  } catch (const std::exception &e) {
+    tables_.erase(childName);
+    meta->removePartition(childName);
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("CREATE TABLE OK");
+}
+
 QueryResult Database::execute_drop_table_statement(
     std::shared_ptr<DropTableStatement> stmt) {
+  const std::string &name = stmt->get_table_name();
+  Table *table = get_table(name);
+  if (!table) {
+    return QueryResult::error_result("Table '" + name + "' not found");
+  }
+  if (table->isPartitioned()) {
+    const auto partitions = table->getPartitionMetadata()->getPartitions();
+    for (const PartitionDescriptor &part : partitions) {
+      tables_.erase(part.childTableName);
+      PersistenceManager::remove_table_file(storage_directory_,
+                                            part.childTableName);
+    }
+    PartitionCatalog::removeParentFile(storage_directory_, name);
+    DropTableExecutor executor(stmt, &tables_, storage_directory_);
+    return executor.execute();
+  }
+  Table *parent = findPartitionParent(name);
+  if (parent) {
+    parent->getMutablePartitionMetadata()->removePartition(name);
+    mark_table_dirty(parent->get_name());
+    try {
+      persistPartitionMetadata(parent->get_name());
+    } catch (const std::exception &e) {
+      return QueryResult::error_result(e.what());
+    }
+  }
   DropTableExecutor executor(stmt, &tables_, storage_directory_);
   return executor.execute();
+}
+
+Table *Database::resolvePartitionChild(Table *parent, const Row &row,
+                                       std::string *error) {
+  if (!parent || !parent->isPartitioned()) {
+    if (error) {
+      *error = "Table is not partitioned";
+    }
+    return nullptr;
+  }
+  const PartitionedTableMetadata *meta = parent->getPartitionMetadata();
+  const int keyIndex = parent->get_column_index(meta->getKeyColumn());
+  if (keyIndex < 0) {
+    if (error) {
+      *error = "Partition key column missing";
+    }
+    return nullptr;
+  }
+  const Value &key = row.get_value(static_cast<size_t>(keyIndex));
+  auto router = meta->createRouter();
+  std::optional<std::string> childName = router->resolveChild(key);
+  if (!childName) {
+    if (error) {
+      *error = "No partition for partition key value " + key.to_string();
+    }
+    return nullptr;
+  }
+  Table *child = get_table(*childName);
+  if (!child) {
+    if (error) {
+      *error = "Partition child '" + *childName + "' not found";
+    }
+    return nullptr;
+  }
+  return child;
+}
+
+std::vector<std::string> Database::listPrunedPartitions(
+    Table *parent, const ExpressionPtr &whereExpr) const {
+  if (!parent || !parent->isPartitioned()) {
+    return {};
+  }
+  const PartitionedTableMetadata *meta = parent->getPartitionMetadata();
+  PartitionPruneRequest request =
+      buildPartitionPruneRequest(meta->getKeyColumn(), whereExpr);
+  return meta->createRouter()->prune(request);
+}
+
+Table *Database::findPartitionParent(const std::string &childName) {
+  for (auto &[name, table] : tables_) {
+    (void)name;
+    if (!table->isPartitioned()) {
+      continue;
+    }
+    if (table->getPartitionMetadata()->hasChild(childName)) {
+      return table.get();
+    }
+  }
+  return nullptr;
+}
+
+std::vector<Row> Database::loadVisibleRowsForRelation(
+    Table *table, const ExpressionPtr &pruneWhere) {
+  if (!table) {
+    return {};
+  }
+  if (!table->isPartitioned()) {
+    SessionContext *session = get_active_session();
+    return table->get_visible_rows(get_transaction_manager(),
+                                   get_reader_xid(session),
+                                   get_reader_snapshot(session));
+  }
+  std::vector<std::string> children = listPrunedPartitions(table, pruneWhere);
+  std::vector<Row> rows;
+  SessionContext *session = get_active_session();
+  for (const std::string &childName : children) {
+    Table *child = get_table(childName);
+    if (!child) {
+      continue;
+    }
+    std::vector<Row> childRows = child->get_visible_rows(
+        get_transaction_manager(), get_reader_xid(session),
+        get_reader_snapshot(session));
+    rows.insert(rows.end(), childRows.begin(), childRows.end());
+  }
+  return rows;
+}
+
+QueryResult Database::execute_partitioned_update(
+    std::shared_ptr<UpdateStatement> stmt, Table *parent) {
+  const std::vector<std::string> children =
+      listPrunedPartitions(parent, stmt->get_where_condition());
+  int updatedCount = 0;
+  for (const std::string &childName : children) {
+    Table *child = get_table(childName);
+    if (!child) {
+      continue;
+    }
+    auto childStmt = std::make_shared<UpdateStatement>(childName);
+    childStmt->set_where_condition(stmt->get_where_condition());
+    for (const auto &clause : stmt->get_set_clauses()) {
+      childStmt->add_set_clause(clause.first, clause.second);
+    }
+    UpdateExecutor probe(childStmt, child, this);
+    std::vector<size_t> matching = probe.collect_matching_indices();
+    std::sort(matching.begin(), matching.end(), std::greater<size_t>());
+    std::vector<SelectColumnBinding> bindings;
+    for (const Column &col : child->get_columns()) {
+      bindings.push_back({childName, childName, col.get_name()});
+    }
+    SelectExpressionEvaluator eval(std::move(bindings));
+    bind_subquery_evaluators(eval, this);
+    TriggerExecutor triggers(this, get_active_session());
+    for (size_t i : matching) {
+      if (i >= child->get_row_count()) {
+        continue;
+      }
+      Row current = child->get_row(i);
+      Row newRow = current;
+      for (const auto &[colName, expr] : stmt->get_set_clauses()) {
+        int colIdx = child->get_column_index(colName);
+        if (colIdx >= 0) {
+          newRow.set_value(static_cast<size_t>(colIdx),
+                           eval.evaluate_dml_assignment_rhs(current, expr));
+        }
+      }
+      try {
+        validate_foreign_keys_on_update(*child, current, newRow);
+        QueryResult before = triggers.executeBeforeUpdate(
+            parent->get_name(), current, newRow);
+        if (!before.success) {
+          return before;
+        }
+        std::string routeError;
+        Table *target = resolvePartitionChild(parent, newRow, &routeError);
+        if (!target) {
+          return QueryResult::error_result(routeError);
+        }
+        if (target == child) {
+          if (get_active_session() && get_active_session()->is_in_transaction()) {
+            child->update_row_versioned(i, newRow,
+                                        get_reader_xid(get_active_session()));
+          } else {
+            child->update_row(i, newRow);
+          }
+        } else {
+          if (get_active_session() && get_active_session()->is_in_transaction()) {
+            child->delete_row_versioned(i, get_reader_xid(get_active_session()));
+            target->insert_row_versioned(newRow,
+                                         get_reader_xid(get_active_session()));
+          } else {
+            child->delete_row(i);
+            target->insert_row(newRow);
+          }
+        }
+        QueryResult after =
+            triggers.executeAfterUpdate(parent->get_name(), current, newRow);
+        if (!after.success) {
+          return after;
+        }
+        ++updatedCount;
+      } catch (const std::exception &e) {
+        return QueryResult::error_result(std::string("Update failed: ") +
+                                         e.what());
+      }
+    }
+  }
+  QueryResult result = QueryResult::success_result("UPDATE OK");
+  result.affected_rows = updatedCount;
+  return result;
+}
+
+QueryResult Database::execute_partitioned_delete(
+    std::shared_ptr<DeleteStatement> stmt, Table *parent) {
+  const std::vector<std::string> children =
+      listPrunedPartitions(parent, stmt->get_where_condition());
+  int deletedCount = 0;
+  TriggerExecutor triggers(this, get_active_session());
+  const bool in_tx =
+      get_active_session() && get_active_session()->is_in_transaction();
+  for (const std::string &childName : children) {
+    Table *child = get_table(childName);
+    if (!child) {
+      continue;
+    }
+    auto childStmt = std::make_shared<DeleteStatement>(childName);
+    childStmt->set_where_condition(stmt->get_where_condition());
+    DeleteExecutor probe(childStmt, child, this);
+    std::vector<size_t> matching = probe.collect_matching_indices();
+    std::sort(matching.begin(), matching.end(), std::greater<size_t>());
+    for (size_t i : matching) {
+      if (i >= child->get_row_count()) {
+        continue;
+      }
+      try {
+        Row row = child->get_row(i);
+        validate_foreign_keys_on_delete(*child, row);
+        QueryResult before =
+            triggers.executeBeforeDelete(parent->get_name(), row);
+        if (!before.success) {
+          return before;
+        }
+        if (in_tx) {
+          child->delete_row_versioned(i, get_reader_xid(get_active_session()));
+        } else {
+          child->delete_row(i);
+        }
+        QueryResult after =
+            triggers.executeAfterDelete(parent->get_name(), row);
+        if (!after.success) {
+          return after;
+        }
+        ++deletedCount;
+        mark_table_dirty(childName);
+      } catch (const std::exception &e) {
+        return QueryResult::error_result(std::string("Delete failed: ") +
+                                         e.what());
+      }
+    }
+  }
+  QueryResult result = QueryResult::success_result("DELETE OK");
+  result.affected_rows = deletedCount;
+  return result;
 }
 
 QueryResult Database::execute_alter_table_statement(
@@ -1215,6 +1783,230 @@ QueryResult Database::execute_drop_view_statement(
     return QueryResult::error_result(e.what());
   }
   return QueryResult::success_result("DROP VIEW OK");
+}
+
+RoutineCatalog &Database::get_routine_catalog() { return routine_catalog_; }
+
+const RoutineCatalog &Database::get_routine_catalog() const {
+  return routine_catalog_;
+}
+
+TriggerCatalog &Database::get_trigger_catalog() { return trigger_catalog_; }
+
+const TriggerCatalog &Database::get_trigger_catalog() const {
+  return trigger_catalog_;
+}
+
+int Database::get_trigger_depth() const {
+  if (active_session_) {
+    return active_session_->get_trigger_depth();
+  }
+  return trigger_depth_;
+}
+
+void Database::enter_trigger_depth() {
+  if (active_session_) {
+    active_session_->enter_trigger();
+    return;
+  }
+  ++trigger_depth_;
+}
+
+void Database::leave_trigger_depth() {
+  if (active_session_) {
+    active_session_->leave_trigger();
+    return;
+  }
+  if (trigger_depth_ > 0) {
+    --trigger_depth_;
+  }
+}
+
+QueryResult Database::run_parsed_statement(const ParsedStatement &stmt,
+                                           SessionContext *session,
+                                           const std::string &sql) {
+  return dispatch_statement(stmt, session, sql);
+}
+
+void Database::set_active_local_variables(
+    std::unordered_map<std::string, Value> locals) {
+  active_local_variables_ = std::move(locals);
+  has_active_local_variables_ = true;
+}
+
+void Database::clear_active_local_variables() {
+  active_local_variables_.clear();
+  has_active_local_variables_ = false;
+}
+
+const std::unordered_map<std::string, Value> *
+Database::get_active_local_variables() const {
+  if (!has_active_local_variables_) {
+    return nullptr;
+  }
+  return &active_local_variables_;
+}
+
+QueryResult Database::execute_create_function_statement(
+    std::shared_ptr<CreateFunctionStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  if (ScalarFunctionRegistry::instance().hasFunction(name)) {
+    return QueryResult::error_result("Cannot override builtin function '" +
+                                     name + "'");
+  }
+  if (expression_has_aggregate(stmt->get_body())) {
+    return QueryResult::error_result(
+        "Aggregate functions are not allowed in scalar function body");
+  }
+  std::vector<SelectColumnBinding> bindings;
+  for (const RoutineParamAst &param : stmt->get_params()) {
+    bindings.push_back({"", "", param.name});
+  }
+  SelectExpressionEvaluator validator(bindings);
+  if (auto err = validator.validate_expression_tree(stmt->get_body())) {
+    return QueryResult::error_result(*err);
+  }
+  try {
+    std::vector<RoutineParameter> params;
+    for (const RoutineParamAst &param : stmt->get_params()) {
+      params.push_back({param.name, string_to_data_type(param.type_name)});
+    }
+    routine_catalog_.registerFunction(std::make_unique<FunctionDefinition>(
+        name, std::move(params), string_to_data_type(stmt->get_return_type()),
+        stmt->get_body(), stmt->get_source_sql()));
+    routine_catalog_.saveFunction(storage_directory_, name);
+  } catch (const std::exception &e) {
+    if (routine_catalog_.hasFunction(name)) {
+      routine_catalog_.unregisterFunction(name);
+    }
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("CREATE FUNCTION OK");
+}
+
+QueryResult Database::execute_drop_function_statement(
+    std::shared_ptr<DropFunctionStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  if (!routine_catalog_.hasFunction(name)) {
+    if (stmt->is_if_exists()) {
+      return QueryResult::success_result("DROP FUNCTION OK");
+    }
+    return QueryResult::error_result("Function '" + name + "' not found");
+  }
+  try {
+    routine_catalog_.unregisterFunction(name);
+    routine_catalog_.removeFunctionFile(storage_directory_, name);
+  } catch (const std::exception &e) {
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("DROP FUNCTION OK");
+}
+
+QueryResult Database::execute_create_procedure_statement(
+    std::shared_ptr<CreateProcedureStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  try {
+    std::vector<RoutineParameter> params;
+    for (const RoutineParamAst &param : stmt->get_params()) {
+      params.push_back({param.name, string_to_data_type(param.type_name)});
+    }
+    routine_catalog_.registerProcedure(std::make_unique<ProcedureDefinition>(
+        name, std::move(params), stmt->get_statement_sqls(),
+        stmt->get_source_sql()));
+    routine_catalog_.saveProcedure(storage_directory_, name);
+  } catch (const std::exception &e) {
+    if (routine_catalog_.hasProcedure(name)) {
+      routine_catalog_.unregisterProcedure(name);
+    }
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("CREATE PROCEDURE OK");
+}
+
+QueryResult Database::execute_drop_procedure_statement(
+    std::shared_ptr<DropProcedureStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  if (!routine_catalog_.hasProcedure(name)) {
+    if (stmt->is_if_exists()) {
+      return QueryResult::success_result("DROP PROCEDURE OK");
+    }
+    return QueryResult::error_result("Procedure '" + name + "' not found");
+  }
+  try {
+    routine_catalog_.unregisterProcedure(name);
+    routine_catalog_.removeProcedureFile(storage_directory_, name);
+  } catch (const std::exception &e) {
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("DROP PROCEDURE OK");
+}
+
+QueryResult Database::execute_call_statement(
+    std::shared_ptr<CallStatement> stmt, SessionContext *session) {
+  const ProcedureDefinition *proc =
+      routine_catalog_.getProcedure(stmt->get_name());
+  if (!proc) {
+    return QueryResult::error_result("Procedure '" + stmt->get_name() +
+                                     "' not found");
+  }
+  SelectExpressionEvaluator arg_eval({});
+  arg_eval.set_routine_catalog(&routine_catalog_);
+  arg_eval.set_correlation_context(&correlation_context_);
+  if (const auto *locals = get_active_local_variables()) {
+    arg_eval.set_local_variables(*locals);
+  }
+  std::vector<Value> args;
+  args.reserve(stmt->get_arguments().size());
+  for (const ExpressionPtr &arg_expr : stmt->get_arguments()) {
+    std::string err;
+    args.push_back(arg_eval.evaluate_expression(Row(), arg_expr, &err));
+    if (!err.empty()) {
+      return QueryResult::error_result(err);
+    }
+  }
+  ProcedureExecutor executor(this, session);
+  return executor.executeCall(*proc, args);
+}
+
+QueryResult Database::execute_create_trigger_statement(
+    std::shared_ptr<CreateTriggerStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  if (!has_table(stmt->get_table_name())) {
+    return QueryResult::error_result("Table '" + stmt->get_table_name() +
+                                     "' not found");
+  }
+  try {
+    trigger_catalog_.registerTrigger(std::make_unique<TriggerDefinition>(
+        name, stmt->get_table_name(), stmt->get_timing(), stmt->get_event(),
+        stmt->get_statement_sqls(), stmt->get_source_sql()));
+    trigger_catalog_.saveTrigger(storage_directory_, name);
+  } catch (const std::exception &e) {
+    if (trigger_catalog_.hasTrigger(name)) {
+      trigger_catalog_.unregisterTrigger(name);
+    }
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("CREATE TRIGGER OK");
+}
+
+QueryResult Database::execute_drop_trigger_statement(
+    std::shared_ptr<DropTriggerStatement> stmt) {
+  const std::string &name = stmt->get_name();
+  if (!trigger_catalog_.hasTrigger(name)) {
+    if (stmt->is_if_exists()) {
+      return QueryResult::success_result("DROP TRIGGER OK");
+    }
+    return QueryResult::error_result("Trigger '" + name + "' not found");
+  }
+  try {
+    const std::string stored_name =
+        trigger_catalog_.getTrigger(name)->getName();
+    trigger_catalog_.unregisterTrigger(name);
+    trigger_catalog_.removeTriggerFile(storage_directory_, stored_name);
+  } catch (const std::exception &e) {
+    return QueryResult::error_result(e.what());
+  }
+  return QueryResult::success_result("DROP TRIGGER OK");
 }
 
 QueryResult Database::execute_begin(SessionContext *session) {
@@ -1328,6 +2120,7 @@ QueryResult Database::execute_vacuum(std::shared_ptr<VacuumStatement> stmt) {
                                      "' not found");
   }
   table->vacuum_versions(transaction_manager_);
+  table_statistics_.refreshTable(*table);
   return QueryResult::success_result("VACUUM OK");
 }
 

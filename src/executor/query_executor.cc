@@ -14,6 +14,7 @@
 #include "executor/select_analysis.h"
 #include "executor/select_expression_evaluator.h"
 #include "executor/select_pipeline.h"
+#include "executor/trigger_executor.h"
 #include "planner/access_path_chooser.h"
 #include "types/type_converter.h"
 
@@ -23,6 +24,10 @@ void bind_subquery_evaluators(SelectExpressionEvaluator &eval,
                               Database *database) {
   if (!database) {
     return;
+  }
+  eval.set_routine_catalog(&database->get_routine_catalog());
+  if (const auto *locals = database->get_active_local_variables()) {
+    eval.set_local_variables(*locals);
   }
   eval.set_scalar_subquery_fn(
       [database](const std::shared_ptr<SelectStatement> &stmt,
@@ -234,6 +239,9 @@ QueryResult SelectExecutor::execute() {
   if (auto validation_err = validate_select_for_grouping(stmt_)) {
     return QueryResult::error_result(*validation_err);
   }
+  if (auto window_err = validate_select_for_windows(stmt_)) {
+    return QueryResult::error_result(*window_err);
+  }
 
   SelectExpressionEvaluator eval =
       evaluator_for_table(table_, stmt_->get_from_alias());
@@ -243,9 +251,26 @@ QueryResult SelectExecutor::execute() {
   }
   bind_subquery_evaluators(eval, database_);
 
-  std::vector<Row> filtered_rows = filter_rows_with_index(
-      table_, stmt_->get_from_alias(), stmt_->get_where_condition(), eval,
-      database_);
+  std::vector<Row> filtered_rows;
+  if (table_->isPartitioned() && database_) {
+    const std::vector<std::string> children = database_->listPrunedPartitions(
+        table_, stmt_->get_where_condition());
+    for (const std::string &childName : children) {
+      Table *child = database_->get_table(childName);
+      if (!child) {
+        continue;
+      }
+      std::vector<Row> partRows = filter_rows_with_index(
+          child, stmt_->get_from_alias(), stmt_->get_where_condition(), eval,
+          database_);
+      filtered_rows.insert(filtered_rows.end(), partRows.begin(),
+                           partRows.end());
+    }
+  } else {
+    filtered_rows = filter_rows_with_index(
+        table_, stmt_->get_from_alias(), stmt_->get_where_condition(), eval,
+        database_);
+  }
 
   if (needs_grouping(stmt_)) {
     GroupAggregateOperator grouping(stmt_, eval);
@@ -286,8 +311,24 @@ QueryResult SelectExecutor::execute() {
         for (size_t i = 0; i < row.get_column_count(); ++i) {
           resultRow.push_back(row.get_value(i));
         }
+      } else if (auto fn =
+                     std::dynamic_pointer_cast<FunctionCallExpression>(expr)) {
+        if (fn->is_windowed()) {
+          resultRow.push_back(Value());
+        } else {
+          std::string eval_error;
+          resultRow.push_back(
+              eval.evaluate_expression(row, expr, &eval_error));
+          if (!eval_error.empty()) {
+            return QueryResult::error_result(eval_error);
+          }
+        }
       } else {
-        resultRow.push_back(eval.evaluate_expression(row, expr, nullptr));
+        std::string eval_error;
+        resultRow.push_back(eval.evaluate_expression(row, expr, &eval_error));
+        if (!eval_error.empty()) {
+          return QueryResult::error_result(eval_error);
+        }
       }
     }
     result.rows.push_back(std::move(resultRow));
@@ -316,12 +357,29 @@ QueryResult InsertExecutor::execute() {
     return QueryResult::error_result("No values to insert");
   }
 
+  SelectExpressionEvaluator eval = evaluator_for_dml_table(table_);
+  if (database_) {
+    eval.set_correlation_context(database_->get_correlation_context());
+    eval.set_bind_context(database_->get_active_bind());
+  }
+  bind_subquery_evaluators(eval, database_);
+  const Row empty_row;
   int inserted_count = 0;
 
   for (const auto &valueRow : values) {
     try {
-      Row row;
+      std::vector<Value> evaluated;
+      evaluated.reserve(valueRow.size());
+      for (const ExpressionPtr &expr : valueRow) {
+        std::string error_msg;
+        evaluated.push_back(
+            eval.evaluate_expression(empty_row, expr, &error_msg));
+        if (!error_msg.empty()) {
+          return QueryResult::error_result(error_msg);
+        }
+      }
 
+      Row row;
       if (!columns.empty()) {
         std::vector<Value> rowValues(table_->get_column_count(), Value());
         for (size_t i = 0; i < table_->get_column_count(); ++i) {
@@ -330,19 +388,19 @@ QueryResult InsertExecutor::execute() {
             rowValues[i] = column.get_default_value();
           }
         }
-        for (size_t i = 0; i < columns.size() && i < valueRow.size(); ++i) {
+        for (size_t i = 0; i < columns.size() && i < evaluated.size(); ++i) {
           int colIdx = table_->get_column_index(columns[i]);
           if (colIdx >= 0) {
-            rowValues[static_cast<size_t>(colIdx)] = valueRow[i];
+            rowValues[static_cast<size_t>(colIdx)] = evaluated[i];
           }
         }
         row = Row(rowValues);
       } else {
-        std::vector<Value> rowValues = valueRow;
+        std::vector<Value> rowValues = evaluated;
         if (rowValues.size() < table_->get_column_count()) {
           rowValues.resize(table_->get_column_count(), Value());
         }
-        for (size_t i = valueRow.size(); i < table_->get_column_count(); ++i) {
+        for (size_t i = evaluated.size(); i < table_->get_column_count(); ++i) {
           const Column &column = table_->get_column(i);
           if (column.has_default()) {
             rowValues[i] = column.get_default_value();
@@ -354,12 +412,47 @@ QueryResult InsertExecutor::execute() {
       if (database_) {
         database_->validate_foreign_keys_on_insert(*table_, row);
       }
+      Table *target = table_;
+      if (table_->isPartitioned()) {
+        if (!database_) {
+          return QueryResult::error_result(
+              "Internal error: partitioned INSERT requires database");
+        }
+        std::string routeError;
+        target = database_->resolvePartitionChild(table_, row, &routeError);
+        if (!target) {
+          return QueryResult::error_result(routeError);
+        }
+      }
+      if (database_) {
+        TriggerExecutor triggers(database_, database_->get_active_session());
+        QueryResult before =
+            triggers.executeBeforeInsert(table_->get_name(), row);
+        if (!before.success) {
+          return before;
+        }
+        if (table_->isPartitioned()) {
+          std::string routeError;
+          target = database_->resolvePartitionChild(table_, row, &routeError);
+          if (!target) {
+            return QueryResult::error_result(routeError);
+          }
+        }
+      }
       if (database_ && database_->get_active_session() &&
           database_->get_active_session()->is_in_transaction()) {
-        table_->insert_row_versioned(
+        target->insert_row_versioned(
             row, database_->get_reader_xid(database_->get_active_session()));
       } else {
-        table_->insert_row(row);
+        target->insert_row(row);
+      }
+      if (database_) {
+        TriggerExecutor triggers(database_, database_->get_active_session());
+        QueryResult after =
+            triggers.executeAfterInsert(table_->get_name(), row);
+        if (!after.success) {
+          return after;
+        }
       }
       inserted_count++;
     } catch (const std::exception &e) {
@@ -456,6 +549,14 @@ QueryResult UpdateExecutor::execute() {
         if (database_) {
           database_->validate_foreign_keys_on_update(*table_, current, new_row);
         }
+        if (database_) {
+          TriggerExecutor triggers(database_, database_->get_active_session());
+          QueryResult before = triggers.executeBeforeUpdate(
+              table_->get_name(), current, new_row);
+          if (!before.success) {
+            return before;
+          }
+        }
         if (database_ && database_->get_active_session() &&
             database_->get_active_session()->is_in_transaction()) {
           table_->update_row_versioned(
@@ -463,6 +564,14 @@ QueryResult UpdateExecutor::execute() {
               database_->get_reader_xid(database_->get_active_session()));
         } else {
           table_->update_row(i, new_row);
+        }
+        if (database_) {
+          TriggerExecutor triggers(database_, database_->get_active_session());
+          QueryResult after = triggers.executeAfterUpdate(
+              table_->get_name(), current, new_row);
+          if (!after.success) {
+            return after;
+          }
         }
         updated_count++;
       } catch (const std::exception &e) {
@@ -546,11 +655,27 @@ QueryResult DeleteExecutor::execute() {
       if (database_) {
         database_->validate_foreign_keys_on_delete(*table_, row);
       }
+      if (database_) {
+        TriggerExecutor triggers(database_, database_->get_active_session());
+        QueryResult before =
+            triggers.executeBeforeDelete(table_->get_name(), row);
+        if (!before.success) {
+          return before;
+        }
+      }
       if (in_tx) {
         table_->delete_row_versioned(
             i, database_->get_reader_xid(database_->get_active_session()));
       } else {
         table_->delete_row(i);
+      }
+      if (database_) {
+        TriggerExecutor triggers(database_, database_->get_active_session());
+        QueryResult after =
+            triggers.executeAfterDelete(table_->get_name(), row);
+        if (!after.success) {
+          return after;
+        }
       }
       deleted_count++;
     } catch (const std::exception &e) {

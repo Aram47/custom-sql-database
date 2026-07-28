@@ -8,6 +8,9 @@
 
 #include "core/check_constraint.h"
 #include "core/foreign_key.h"
+#include "core/partition.h"
+#include "core/trigger.h"
+#include "types/data_type.h"
 #include "types/value.h"
 #include "utils/exceptions.h"
 
@@ -120,17 +123,48 @@ class UnaryOpExpression : public Expression {
   ExpressionPtr expr_;
 };
 
+/** PARTITION BY / ORDER BY clause for a window function OVER (...). */
+class WindowSpec {
+ public:
+  void add_partition_by(ExpressionPtr expr);
+  void add_order_by(ExpressionPtr expr, bool ascending = true);
+  const std::vector<ExpressionPtr> &get_partition_by() const;
+  const std::vector<std::pair<ExpressionPtr, bool>> &get_order_by() const;
+  std::string to_string() const;
+
+ private:
+  std::vector<ExpressionPtr> partition_by_;
+  std::vector<std::pair<ExpressionPtr, bool>> order_by_;
+};
+
 class FunctionCallExpression : public Expression {
  public:
   FunctionCallExpression(const std::string &name,
                          std::vector<ExpressionPtr> args);
   const std::string &get_function_name() const;
   const std::vector<ExpressionPtr> &get_arguments() const;
+  void set_window_spec(std::shared_ptr<WindowSpec> windowSpec);
+  const std::shared_ptr<WindowSpec> &get_window_spec() const;
+  bool is_windowed() const;
   std::string to_string() const override;
 
  private:
   std::string name_;
   std::vector<ExpressionPtr> args_;
+  std::shared_ptr<WindowSpec> window_spec_;
+};
+
+/** CAST(expr AS type) — type conversion at evaluation time. */
+class CastExpression : public Expression {
+ public:
+  CastExpression(ExpressionPtr expr, DataType target_type);
+  const ExpressionPtr &get_expression() const;
+  DataType get_target_type() const;
+  std::string to_string() const override;
+
+ private:
+  ExpressionPtr expr_;
+  DataType target_type_;
 };
 
 class CaseExpression : public Expression {
@@ -200,23 +234,64 @@ class SelectStatement {
   int offset_;
 };
 
+/** Kind of SQL set operation between query operands. */
+enum class SetOperationKind { Union, Intersect, Except };
+
+/**
+ * Binary set-operation tree (UNION / INTERSECT / EXCEPT).
+ * ORDER BY / LIMIT / OFFSET apply only on the outermost node.
+ */
+class SetOperationStatement {
+ public:
+  using Operand = std::variant<std::shared_ptr<SelectStatement>,
+                               std::shared_ptr<SetOperationStatement>>;
+
+  SetOperationStatement(Operand left, SetOperationKind kind, Operand right,
+                        bool isAll = false);
+
+  const Operand &get_left() const;
+  const Operand &get_right() const;
+  SetOperationKind get_kind() const;
+  bool is_all() const;
+
+  void add_order_by_column(ExpressionPtr expr, bool ascending = true);
+  void set_limit(int limit);
+  void set_offset(int offset);
+
+  const std::vector<std::pair<ExpressionPtr, bool>> &get_order_by_columns()
+      const;
+  int get_limit() const;
+  int get_offset() const;
+
+  std::string to_string() const;
+
+ private:
+  Operand left_;
+  Operand right_;
+  SetOperationKind kind_;
+  bool is_all_;
+  std::vector<std::pair<ExpressionPtr, bool>> order_by_columns_;
+  int limit_;
+  int offset_;
+};
+
 class InsertStatement {
  public:
   explicit InsertStatement(const std::string &table);
 
   const std::string &get_table() const;
   void add_column(const std::string &col);
-  void add_values(const std::vector<Value> &vals);
+  void add_values(const std::vector<ExpressionPtr> &vals);
 
   const std::vector<std::string> &get_columns() const;
-  const std::vector<std::vector<Value>> &get_values() const;
+  const std::vector<std::vector<ExpressionPtr>> &get_values() const;
 
   std::string to_string() const;
 
  private:
   std::string table_;
   std::vector<std::string> columns_;
-  std::vector<std::vector<Value>> values_;
+  std::vector<std::vector<ExpressionPtr>> values_;
 };
 
 class UpdateStatement {
@@ -309,6 +384,18 @@ class CreateTableStatement {
   const std::vector<ForeignKeyDefinition> &get_foreign_keys() const;
   const std::vector<CheckConstraintDefinition> &get_checks() const;
 
+  /** Marks this as a partitioned parent: PARTITION BY RANGE|HASH (col). */
+  void setPartitionBy(PartitionKind kind, std::string keyColumn);
+  bool hasPartitionBy() const;
+  PartitionKind getPartitionKind() const;
+  const std::string &getPartitionKeyColumn() const;
+
+  /** Marks this as CREATE TABLE child PARTITION OF parent FOR VALUES ... */
+  void setPartitionOf(std::string parentName, PartitionBound bound);
+  bool isPartitionOf() const;
+  const std::string &getPartitionOfParent() const;
+  const PartitionBound &getPartitionBound() const;
+
   std::string to_string() const;
 
  private:
@@ -316,6 +403,12 @@ class CreateTableStatement {
   std::vector<ColumnDefinition> columns_;
   std::vector<ForeignKeyDefinition> foreign_keys_;
   std::vector<CheckConstraintDefinition> checks_;
+  bool has_partition_by_{false};
+  PartitionKind partition_kind_{PartitionKind::Range};
+  std::string partition_key_column_;
+  bool is_partition_of_{false};
+  std::string partition_of_parent_;
+  PartitionBound partition_bound_;
 };
 
 class DropTableStatement {
@@ -418,6 +511,142 @@ class DropViewStatement {
  private:
   std::string view_name_;
   bool if_exists_{false};
+};
+
+/** Parameter name + SQL type for CREATE FUNCTION / PROCEDURE. */
+struct RoutineParamAst {
+  std::string name;
+  std::string type_name;
+};
+
+/** CREATE FUNCTION name(...) RETURNS type AS $$...$$ | AS (expr). */
+class CreateFunctionStatement {
+ public:
+  CreateFunctionStatement(std::string name, std::vector<RoutineParamAst> params,
+                          std::string return_type, ExpressionPtr body,
+                          std::string source_sql);
+  const std::string &get_name() const;
+  const std::vector<RoutineParamAst> &get_params() const;
+  const std::string &get_return_type() const;
+  const ExpressionPtr &get_body() const;
+  const std::string &get_source_sql() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  std::vector<RoutineParamAst> params_;
+  std::string return_type_;
+  ExpressionPtr body_;
+  std::string source_sql_;
+};
+
+class DropFunctionStatement {
+ public:
+  explicit DropFunctionStatement(std::string name, bool if_exists = false);
+  const std::string &get_name() const;
+  bool is_if_exists() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  bool if_exists_{false};
+};
+
+/** CREATE PROCEDURE name(...) AS $$ statements $$ */
+class CreateProcedureStatement {
+ public:
+  CreateProcedureStatement(std::string name,
+                           std::vector<RoutineParamAst> params,
+                           std::vector<std::string> statement_sqls,
+                           std::string source_sql);
+  const std::string &get_name() const;
+  const std::vector<RoutineParamAst> &get_params() const;
+  const std::vector<std::string> &get_statement_sqls() const;
+  const std::string &get_source_sql() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  std::vector<RoutineParamAst> params_;
+  std::vector<std::string> statement_sqls_;
+  std::string source_sql_;
+};
+
+class DropProcedureStatement {
+ public:
+  explicit DropProcedureStatement(std::string name, bool if_exists = false);
+  const std::string &get_name() const;
+  bool is_if_exists() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  bool if_exists_{false};
+};
+
+/** CALL name(arg, ...) */
+class CallStatement {
+ public:
+  CallStatement(std::string name, std::vector<ExpressionPtr> arguments);
+  const std::string &get_name() const;
+  const std::vector<ExpressionPtr> &get_arguments() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  std::vector<ExpressionPtr> arguments_;
+};
+
+/**
+ * CREATE TRIGGER name BEFORE|AFTER INSERT|UPDATE|DELETE ON table
+ * FOR EACH ROW EXECUTE $$ statements $$
+ */
+class CreateTriggerStatement {
+ public:
+  CreateTriggerStatement(std::string name, std::string table_name,
+                         TriggerTiming timing, TriggerEvent event,
+                         std::vector<std::string> statement_sqls,
+                         std::string source_sql);
+  const std::string &get_name() const;
+  const std::string &get_table_name() const;
+  TriggerTiming get_timing() const;
+  TriggerEvent get_event() const;
+  const std::vector<std::string> &get_statement_sqls() const;
+  const std::string &get_source_sql() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  std::string table_name_;
+  TriggerTiming timing_;
+  TriggerEvent event_;
+  std::vector<std::string> statement_sqls_;
+  std::string source_sql_;
+};
+
+class DropTriggerStatement {
+ public:
+  explicit DropTriggerStatement(std::string name, bool if_exists = false);
+  const std::string &get_name() const;
+  bool is_if_exists() const;
+  std::string to_string() const;
+
+ private:
+  std::string name_;
+  bool if_exists_{false};
+};
+
+/** SET NEW.column = expression — valid only inside BEFORE trigger bodies. */
+class SetNewStatement {
+ public:
+  SetNewStatement(std::string column_name, ExpressionPtr value);
+  const std::string &get_column_name() const;
+  const ExpressionPtr &get_value() const;
+  std::string to_string() const;
+
+ private:
+  std::string column_name_;
+  ExpressionPtr value_;
 };
 
 class BeginStatement {

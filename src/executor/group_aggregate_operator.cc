@@ -26,6 +26,12 @@ void collect_aggregate_expressions(
     std::vector<ExpressionPtr> *out) {
   if (!expr) return;
   if (auto fn = std::dynamic_pointer_cast<FunctionCallExpression>(expr)) {
+    if (fn->is_windowed()) {
+      for (const auto &arg : fn->get_arguments()) {
+        collect_aggregate_expressions(arg, seen, out);
+      }
+      return;
+    }
     if (is_aggregate_function_name(fn->get_function_name())) {
       const std::string key = fn->to_string();
       if (seen->insert(key).second) out->push_back(expr);
@@ -281,6 +287,12 @@ QueryResult GroupAggregateOperator::apply(
     std::vector<Value> out_row;
     for (const auto &[expr, alias] : select_cols) {
       (void)alias;
+      if (auto fn = std::dynamic_pointer_cast<FunctionCallExpression>(expr)) {
+        if (fn->is_windowed()) {
+          out_row.push_back(Value());
+          continue;
+        }
+      }
       if (expression_has_aggregate(expr)) {
         auto fn = std::dynamic_pointer_cast<FunctionCallExpression>(expr);
         if (fn && is_aggregate_function_name(fn->get_function_name())) {

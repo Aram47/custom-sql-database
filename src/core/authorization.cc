@@ -9,6 +9,9 @@ bool can_reader_execute(const ParsedStatement &stmt) {
   if (std::holds_alternative<std::shared_ptr<SelectStatement>>(stmt)) {
     return true;
   }
+  if (std::holds_alternative<std::shared_ptr<SetOperationStatement>>(stmt)) {
+    return true;
+  }
   if (auto explain =
           std::get_if<std::shared_ptr<ExplainStatement>>(&stmt)) {
     return can_reader_execute((*explain)->get_inner());
@@ -28,6 +31,12 @@ bool can_reader_execute(const ParsedStatement &stmt) {
     } catch (...) {
       return false;
     }
+  }
+  if (auto call = std::get_if<std::shared_ptr<CallStatement>>(&stmt)) {
+    (void)call;
+    // Body checked at CALL time against catalog when Database is available;
+    // conservative default: deny CALL for readers without catalog context.
+    return false;
   }
   return false;
 }

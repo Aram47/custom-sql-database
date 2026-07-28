@@ -27,6 +27,8 @@ class QueryExplainer {
 
   std::vector<std::string> explainSelect(
       const std::shared_ptr<SelectStatement> &stmt) const;
+  std::vector<std::string> explainSetOperation(
+      const std::shared_ptr<SetOperationStatement> &stmt) const;
   std::vector<std::string> explainInsert(
       const std::shared_ptr<InsertStatement> &stmt) const;
   std::vector<std::string> explainUpdate(

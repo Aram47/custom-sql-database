@@ -15,21 +15,92 @@ SelectExpressionEvaluator make_table_check_evaluator(const Table &table) {
   return SelectExpressionEvaluator(std::move(bindings));
 }
 
+std::atomic<FileId> g_next_file_id{1};
+
 }  // namespace
 
-Table::Table(const std::string &name) : table_name_(name) {}
+FileId Table::allocate_file_id() { return g_next_file_id.fetch_add(1); }
+
+void Table::initialize_heap() {
+  heap_ = std::make_unique<HeapFile>(file_id_, *buffer_pool_, *owned_store_,
+                                     collect_column_types());
+}
+
+Table::Table(const std::string &name)
+    : table_name_(name),
+      owned_store_(std::make_unique<MemoryPageStore>()),
+      owned_pool_(std::make_unique<BufferPool>(8)),
+      buffer_pool_(owned_pool_.get()),
+      file_id_(allocate_file_id()) {
+  initialize_heap();
+}
+
+Table::Table(const std::string &name, FileId file_id, IBufferPool &buffer_pool,
+             std::unique_ptr<IPageStore> page_store)
+    : table_name_(name),
+      owned_store_(std::move(page_store)),
+      buffer_pool_(&buffer_pool),
+      file_id_(file_id) {
+  if (!owned_store_) {
+    throw StorageException("Table requires a page store");
+  }
+  initialize_heap();
+}
+
+std::vector<DataType> Table::collect_column_types() const {
+  std::vector<DataType> types;
+  types.reserve(columns_.size());
+  for (const Column &col : columns_) {
+    types.push_back(col.get_type());
+  }
+  return types;
+}
+
+void Table::sync_heap_column_types() {
+  heap_->set_column_types(collect_column_types());
+}
 
 std::unique_ptr<Table> Table::clone() const {
   auto copy = std::make_unique<Table>(table_name_);
   copy->columns_ = columns_;
-  copy->rows_ = rows_;
+  copy->sync_heap_column_types();
+  for (const ItemPointer &pointer : row_directory_) {
+    const Row row = heap_->get_row(pointer);
+    copy->row_directory_.push_back(copy->heap_->insert_row(row));
+  }
   copy->secondary_indexes_ = secondary_indexes_;
   copy->foreign_keys_ = foreign_keys_;
   copy->checks_ = checks_;
+  if (partition_meta_) {
+    auto metaCopy = std::make_unique<PartitionedTableMetadata>(
+        partition_meta_->getKind(), partition_meta_->getKeyColumn());
+    for (const PartitionDescriptor &part : partition_meta_->getPartitions()) {
+      std::string error;
+      metaCopy->addPartition(part, &error);
+    }
+    copy->partition_meta_ = std::move(metaCopy);
+  }
   copy->rebuild_indexes();
   copy->dirty_ = dirty_;
   return copy;
 }
+
+bool Table::isPartitioned() const { return partition_meta_ != nullptr; }
+
+const PartitionedTableMetadata *Table::getPartitionMetadata() const {
+  return partition_meta_.get();
+}
+
+PartitionedTableMetadata *Table::getMutablePartitionMetadata() {
+  return partition_meta_.get();
+}
+
+void Table::setPartitionMetadata(
+    std::unique_ptr<PartitionedTableMetadata> metadata) {
+  partition_meta_ = std::move(metadata);
+}
+
+void Table::clearPartitionMetadata() { partition_meta_.reset(); }
 
 const std::string &Table::get_name() const { return table_name_; }
 
@@ -37,7 +108,7 @@ void Table::set_name(const std::string &name) { table_name_ = name; }
 
 size_t Table::get_column_count() const { return columns_.size(); }
 
-size_t Table::get_row_count() const { return rows_.size(); }
+size_t Table::get_row_count() const { return row_directory_.size(); }
 
 void Table::add_column(const Column &column) {
   for (const auto &col : columns_) {
@@ -46,14 +117,19 @@ void Table::add_column(const Column &column) {
                                 "' already exists");
     }
   }
-  if (!column.is_nullable() && !rows_.empty()) {
+  if (!column.is_nullable() && !row_directory_.empty()) {
     throw ConstraintException(
         "Cannot add NOT NULL column '" + column.get_name() +
         "' to a non-empty table without a default value");
   }
+  std::vector<Row> existing = get_all_rows();
   columns_.push_back(column);
-  for (Row &row : rows_) {
+  heap_->clear();
+  row_directory_.clear();
+  sync_heap_column_types();
+  for (Row &row : existing) {
     row.add_value(Value());
+    row_directory_.push_back(heap_->insert_row(row));
   }
   if (column.is_primary_key() || column.is_unique()) {
     build_index(column.get_name());
@@ -83,9 +159,14 @@ void Table::drop_column(const std::string &column_name) {
     secondary_indexes_.erase(index_name);
     named_indices_.erase(index_name);
   }
+  std::vector<Row> existing = get_all_rows();
   columns_.erase(columns_.begin() + col_idx);
-  for (Row &row : rows_) {
+  heap_->clear();
+  row_directory_.clear();
+  sync_heap_column_types();
+  for (Row &row : existing) {
     row.remove_value(static_cast<size_t>(col_idx));
+    row_directory_.push_back(heap_->insert_row(row));
   }
   rebuild_indexes();
   mark_dirty();
@@ -211,8 +292,8 @@ void Table::insert_row(const Row &row) {
   if (!validate_row(row)) {
     throw ConstraintException("Row does not satisfy table constraints");
   }
-  rows_.push_back(row);
-  insert_into_indexes(row, rows_.size() - 1);
+  row_directory_.push_back(heap_->insert_row(row));
+  insert_into_indexes(row, row_directory_.size() - 1);
   mark_dirty();
 }
 
@@ -222,15 +303,23 @@ void Table::insert_row_versioned(Row row, uint64_t xmin) {
   insert_row(row);
 }
 
-std::vector<Row> Table::get_all_rows() const { return rows_; }
+std::vector<Row> Table::get_all_rows() const {
+  std::vector<Row> rows;
+  rows.reserve(row_directory_.size());
+  for (const ItemPointer &pointer : row_directory_) {
+    rows.push_back(heap_->get_row(pointer));
+  }
+  return rows;
+}
 
 std::vector<size_t> Table::get_visible_row_indices(
     const TransactionManager &txn_manager, uint64_t reader_xid,
     const TransactionSnapshot *snapshot) const {
   std::vector<size_t> result;
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    if (txn_manager.isVisible(rows_[i].get_xmin(), rows_[i].get_xmax(),
-                              reader_xid, snapshot)) {
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    const Row row = heap_->get_row(row_directory_[i]);
+    if (txn_manager.isVisible(row.get_xmin(), row.get_xmax(), reader_xid,
+                              snapshot)) {
       result.push_back(i);
     }
   }
@@ -242,21 +331,25 @@ std::vector<Row> Table::get_visible_rows(
     const TransactionSnapshot *snapshot) const {
   std::vector<Row> result;
   for (size_t i : get_visible_row_indices(txn_manager, reader_xid, snapshot)) {
-    result.push_back(rows_[i]);
+    result.push_back(get_row(i));
   }
   return result;
 }
 
 Row Table::get_row(size_t index) const {
-  if (index >= rows_.size()) {
+  if (index >= row_directory_.size()) {
     throw std::out_of_range("Row index " + std::to_string(index) +
                             " out of range");
   }
-  return rows_[index];
+  return heap_->get_row(row_directory_[index]);
+}
+
+void Table::replace_row(size_t index, const Row &row) {
+  row_directory_[index] = heap_->update_row(row_directory_[index], row);
 }
 
 void Table::update_row(size_t index, const Row &row) {
-  if (index >= rows_.size()) {
+  if (index >= row_directory_.size()) {
     throw std::out_of_range("Row index out of range");
   }
   validate_schema(row);
@@ -266,18 +359,18 @@ void Table::update_row(size_t index, const Row &row) {
   if (!validate_row(row, index)) {
     throw ConstraintException("Updated row does not satisfy table constraints");
   }
-  remove_from_indexes(rows_[index], index);
-  const uint64_t xmin = rows_[index].get_xmin();
-  const uint64_t xmax = rows_[index].get_xmax();
-  rows_[index] = row;
-  rows_[index].set_xmin(xmin);
-  rows_[index].set_xmax(xmax);
-  insert_into_indexes(rows_[index], index);
+  const Row old_row = get_row(index);
+  remove_from_indexes(old_row, index);
+  Row stored = row;
+  stored.set_xmin(old_row.get_xmin());
+  stored.set_xmax(old_row.get_xmax());
+  replace_row(index, stored);
+  insert_into_indexes(stored, index);
   mark_dirty();
 }
 
 void Table::update_row_versioned(size_t index, Row new_row, uint64_t xid) {
-  if (index >= rows_.size()) {
+  if (index >= row_directory_.size()) {
     throw std::out_of_range("Row index out of range");
   }
   validate_schema(new_row);
@@ -287,28 +380,33 @@ void Table::update_row_versioned(size_t index, Row new_row, uint64_t xid) {
   if (!validate_row(new_row, index)) {
     throw ConstraintException("Updated row does not satisfy table constraints");
   }
-  rows_[index].set_xmax(xid);
+  Row old_row = get_row(index);
+  old_row.set_xmax(xid);
+  replace_row(index, old_row);
   new_row.set_xmin(xid);
   new_row.set_xmax(0);
-  rows_.push_back(new_row);
-  insert_into_indexes(new_row, rows_.size() - 1);
+  row_directory_.push_back(heap_->insert_row(new_row));
+  insert_into_indexes(new_row, row_directory_.size() - 1);
   mark_dirty();
 }
 
 void Table::delete_row(size_t index) {
-  if (index >= rows_.size()) {
+  if (index >= row_directory_.size()) {
     throw std::out_of_range("Row index out of range");
   }
-  rows_.erase(rows_.begin() + static_cast<long>(index));
+  heap_->delete_slot(row_directory_[index]);
+  row_directory_.erase(row_directory_.begin() + static_cast<long>(index));
   reindex_after_delete();
   mark_dirty();
 }
 
 void Table::delete_row_versioned(size_t index, uint64_t xid) {
-  if (index >= rows_.size()) {
+  if (index >= row_directory_.size()) {
     throw std::out_of_range("Row index out of range");
   }
-  rows_[index].set_xmax(xid);
+  Row row = get_row(index);
+  row.set_xmax(xid);
+  replace_row(index, row);
   mark_dirty();
 }
 
@@ -319,8 +417,9 @@ void Table::vacuum_versions(const TransactionManager &txn_manager) {
 void Table::vacuum_versions(const TransactionManager &txn_manager,
                             uint64_t vacuum_horizon) {
   std::vector<Row> kept;
-  kept.reserve(rows_.size());
-  for (Row &row : rows_) {
+  kept.reserve(row_directory_.size());
+  for (const ItemPointer &pointer : row_directory_) {
+    Row row = heap_->get_row(pointer);
     if (txn_manager.isAborted(row.get_xmin())) {
       continue;
     }
@@ -333,13 +432,19 @@ void Table::vacuum_versions(const TransactionManager &txn_manager,
     }
     kept.push_back(std::move(row));
   }
-  rows_ = std::move(kept);
+  heap_->clear();
+  row_directory_.clear();
+  sync_heap_column_types();
+  for (const Row &row : kept) {
+    row_directory_.push_back(heap_->insert_row(row));
+  }
   rebuild_indexes();
   mark_dirty();
 }
 
 void Table::delete_all() {
-  rows_.clear();
+  heap_->clear();
+  row_directory_.clear();
   for (auto &[col_name, idx] : column_indices_) {
     (void)col_name;
     idx->clear();
@@ -375,8 +480,8 @@ std::vector<size_t> Table::find_rows_by_value(const std::string &column_name,
     return named->second->find_prefix(IndexKey(value));
   }
   std::vector<size_t> result;
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    if (rows_[i].get_value(static_cast<size_t>(col_idx)) == value) {
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    if (get_row(i).get_value(static_cast<size_t>(col_idx)) == value) {
       result.push_back(i);
     }
   }
@@ -407,8 +512,8 @@ std::vector<size_t> Table::find_rows_by_range(
     }
   }
   std::vector<size_t> result;
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    const Value &v = rows_[i].get_value(static_cast<size_t>(col_idx));
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    const Value &v = get_row(i).get_value(static_cast<size_t>(col_idx));
     if (v.is_null()) {
       continue;
     }
@@ -430,8 +535,8 @@ std::vector<size_t> Table::find_rows_by_range(
 std::vector<size_t> Table::find_rows_by_predicate(
     std::function<bool(const Row &)> predicate) const {
   std::vector<size_t> result;
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    if (predicate(rows_[i])) {
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    if (predicate(get_row(i))) {
       result.push_back(i);
     }
   }
@@ -555,17 +660,17 @@ bool Table::validate_primary_key_uniqueness(const Row &row,
     auto matches = find_rows_by_value(
         columns_[static_cast<size_t>(pk_idx)].get_name(), pk_value);
     for (size_t idx : matches) {
-      if (idx != exclude_row_index && rows_[idx].get_xmax() == 0) {
+      if (idx != exclude_row_index && get_row(idx).get_xmax() == 0) {
         return false;
       }
     }
     return true;
   }
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    if (i == exclude_row_index || rows_[i].get_xmax() != 0) {
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    if (i == exclude_row_index || get_row(i).get_xmax() != 0) {
       continue;
     }
-    if (rows_[i].get_value(static_cast<size_t>(pk_idx)) == pk_value) {
+    if (get_row(i).get_value(static_cast<size_t>(pk_idx)) == pk_value) {
       return false;
     }
   }
@@ -585,17 +690,17 @@ bool Table::validate_unique_constraint(const Row &row,
     if (has_index(columns_[i].get_name())) {
       auto matches = find_rows_by_value(columns_[i].get_name(), value);
       for (size_t idx : matches) {
-        if (idx != exclude_row_index && rows_[idx].get_xmax() == 0) {
+        if (idx != exclude_row_index && get_row(idx).get_xmax() == 0) {
           return false;
         }
       }
       continue;
     }
-    for (size_t j = 0; j < rows_.size(); ++j) {
-      if (j == exclude_row_index || rows_[j].get_xmax() != 0) {
+    for (size_t j = 0; j < row_directory_.size(); ++j) {
+      if (j == exclude_row_index || get_row(j).get_xmax() != 0) {
         continue;
       }
-      if (rows_[j].get_value(i) == value) {
+      if (get_row(j).get_value(i) == value) {
         return false;
       }
     }
@@ -763,15 +868,13 @@ void Table::clear_dirty() { dirty_ = false; }
 
 bool Table::is_dirty() const { return dirty_; }
 
-std::vector<Row> &Table::get_mutable_rows() { return rows_; }
-
 std::string Table::to_string() const {
   std::string str = "Table: " + table_name_ + "\n";
   str += "Columns:\n";
   for (const auto &col : columns_) {
     str += "  " + col.to_string() + "\n";
   }
-  str += "Rows: " + std::to_string(rows_.size()) + "\n";
+  str += "Rows: " + std::to_string(row_directory_.size()) + "\n";
   return str;
 }
 
@@ -781,8 +884,8 @@ void Table::build_index(const std::string &column_name) {
     throw NotFoundException("Column '" + column_name + "' not found");
   }
   auto idx = std::make_unique<BTreeIndex>();
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    idx->insert(rows_[i].get_value(static_cast<size_t>(col_idx)), i);
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    idx->insert(get_row(i).get_value(static_cast<size_t>(col_idx)), i);
   }
   column_indices_[column_name] = std::move(idx);
 }
@@ -793,8 +896,8 @@ void Table::build_named_index(const std::string &index_name) {
     return;
   }
   auto idx = std::make_unique<BTreeIndex>();
-  for (size_t i = 0; i < rows_.size(); ++i) {
-    idx->insert(build_index_key(rows_[i], it->second), i);
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    idx->insert(build_index_key(get_row(i), it->second), i);
   }
   named_indices_[index_name] = std::move(idx);
 }
@@ -822,8 +925,8 @@ void Table::reindex_after_delete() {
     if (col_idx < 0) {
       continue;
     }
-    for (size_t i = 0; i < rows_.size(); ++i) {
-      idx->insert(rows_[i].get_value(static_cast<size_t>(col_idx)), i);
+    for (size_t i = 0; i < row_directory_.size(); ++i) {
+      idx->insert(get_row(i).get_value(static_cast<size_t>(col_idx)), i);
     }
   }
   for (const auto &[index_name, columns] : secondary_indexes_) {
@@ -832,10 +935,30 @@ void Table::reindex_after_delete() {
       continue;
     }
     it->second->clear();
-    for (size_t i = 0; i < rows_.size(); ++i) {
-      it->second->insert(build_index_key(rows_[i], columns), i);
+    for (size_t i = 0; i < row_directory_.size(); ++i) {
+      it->second->insert(build_index_key(get_row(i), columns), i);
     }
   }
 }
+
+HeapFile &Table::get_heap() { return *heap_; }
+
+const HeapFile &Table::get_heap() const { return *heap_; }
+
+FileId Table::get_file_id() const { return file_id_; }
+
+void Table::rebuild_row_directory() {
+  row_directory_.clear();
+  heap_->scan([&](const ItemPointer &pointer, const Row &) {
+    row_directory_.push_back(pointer);
+  });
+}
+
+void Table::replace_heap_pages(const std::vector<std::vector<uint8_t>> &pages) {
+  heap_->replace_pages(pages);
+  rebuild_row_directory();
+}
+
+void Table::flush_heap() { buffer_pool_->flush_file(file_id_); }
 
 }  // namespace db

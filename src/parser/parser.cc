@@ -7,6 +7,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "types/data_type.h"
+
 namespace db {
 
 Parser::Parser(const std::string &sql) : current_(0), original_sql_(sql) {
@@ -107,8 +109,8 @@ ExpressionPtr Parser::parse_standalone_expression() {
 
 ParsedStatement Parser::parse_inner_statement() {
   ParsedStatement result;
-  if (check(TokenType::SELECT)) {
-    result = parse_select_statement();
+  if (check(TokenType::SELECT) || check(TokenType::LPAREN)) {
+    result = parse_query_statement();
   } else if (check(TokenType::INSERT)) {
     result = parse_insert_statement();
   } else if (check(TokenType::UPDATE)) {
@@ -120,6 +122,12 @@ ParsedStatement Parser::parse_inner_statement() {
       result = parse_create_index_statement();
     } else if (peek_ahead(1).get_type() == TokenType::VIEW) {
       result = parse_create_view_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::FUNCTION) {
+      result = parse_create_function_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::PROCEDURE) {
+      result = parse_create_procedure_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::TRIGGER) {
+      result = parse_create_trigger_statement();
     } else {
       result = parse_create_table_statement();
     }
@@ -128,9 +136,19 @@ ParsedStatement Parser::parse_inner_statement() {
       result = parse_drop_index_statement();
     } else if (peek_ahead(1).get_type() == TokenType::VIEW) {
       result = parse_drop_view_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::FUNCTION) {
+      result = parse_drop_function_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::PROCEDURE) {
+      result = parse_drop_procedure_statement();
+    } else if (peek_ahead(1).get_type() == TokenType::TRIGGER) {
+      result = parse_drop_trigger_statement();
     } else {
       result = parse_drop_table_statement();
     }
+  } else if (check(TokenType::CALL)) {
+    result = parse_call_statement();
+  } else if (check(TokenType::SET)) {
+    result = parse_set_new_statement();
   } else if (check(TokenType::ALTER)) {
     result = parse_alter_table_statement();
   } else if (check(TokenType::BEGIN)) {
@@ -177,6 +195,9 @@ std::string statement_to_string(const ParsedStatement &stmt) {
   if (auto p = std::get_if<std::shared_ptr<SelectStatement>>(&stmt)) {
     return (*p)->to_string();
   }
+  if (auto p = std::get_if<std::shared_ptr<SetOperationStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
   if (auto p = std::get_if<std::shared_ptr<InsertStatement>>(&stmt)) {
     return (*p)->to_string();
   }
@@ -205,6 +226,30 @@ std::string statement_to_string(const ParsedStatement &stmt) {
     return (*p)->to_string();
   }
   if (auto p = std::get_if<std::shared_ptr<DropViewStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<CreateFunctionStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<DropFunctionStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<CreateProcedureStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<DropProcedureStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<CallStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<CreateTriggerStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<DropTriggerStatement>>(&stmt)) {
+    return (*p)->to_string();
+  }
+  if (auto p = std::get_if<std::shared_ptr<SetNewStatement>>(&stmt)) {
     return (*p)->to_string();
   }
   if (auto p = std::get_if<std::shared_ptr<BeginStatement>>(&stmt)) {
@@ -238,16 +283,12 @@ std::string ExplainStatement::to_string() const {
   return "EXPLAIN " + statement_to_string(inner_);
 }
 
-std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
+std::shared_ptr<SelectStatement> Parser::parse_select_core() {
   consume(TokenType::SELECT, "Expected SELECT");
   auto stmt = std::make_shared<SelectStatement>();
-
-  // Check for DISTINCT
   if (match(TokenType::DISTINCT)) {
     stmt->set_distinct(true);
   }
-
-  // Parse select columns
   do {
     auto expr = parse_expression();
     std::string alias;
@@ -257,8 +298,6 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
     }
     stmt->add_select_column(expr, alias);
   } while (match(TokenType::COMMA));
-
-  // Parse FROM clause
   if (match(TokenType::FROM)) {
     std::string table =
         consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
@@ -267,14 +306,11 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
       alias = consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
     }
     stmt->set_from_table(table, alias);
-
-    // Parse JOINs
     while (check(TokenType::INNER) || check(TokenType::LEFT) ||
            check(TokenType::RIGHT) || check(TokenType::JOIN) ||
            check(TokenType::FULL) || check(TokenType::CROSS)) {
       std::string joinType;
       ExpressionPtr condition;
-
       if (match(TokenType::CROSS)) {
         consume(TokenType::JOIN, "Expected JOIN");
         joinType = "CROSS";
@@ -296,7 +332,6 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
         }
         consume(TokenType::JOIN, "Expected JOIN");
       }
-
       std::string joinTable =
           consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
       std::string joinAlias = joinTable;
@@ -304,7 +339,6 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
         joinAlias =
             consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
       }
-
       if (joinType == "CROSS") {
         if (match(TokenType::ON)) {
           throw ParseException(
@@ -318,60 +352,137 @@ std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
           condition = parse_expression();
         }
       }
-
       stmt->add_join(joinType, joinTable, joinAlias, condition);
     }
   }
-
-  // Parse WHERE clause
   if (match(TokenType::WHERE)) {
     stmt->set_where_condition(parse_expression());
   }
-
-  // Parse GROUP BY clause
   if (match(TokenType::GROUP)) {
     consume(TokenType::BY, "Expected BY");
     do {
       stmt->add_group_by_column(parse_expression());
     } while (match(TokenType::COMMA));
   }
-
-  // Parse HAVING clause
   if (match(TokenType::HAVING)) {
     stmt->set_having_condition(parse_expression());
   }
+  return stmt;
+}
 
-  // Parse ORDER BY clause
+void Parser::parse_order_limit_clauses(SelectStatement &stmt) {
   if (match(TokenType::ORDER)) {
     consume(TokenType::BY, "Expected BY");
     do {
       auto expr = parse_expression();
       bool ascending = !match(TokenType::DESC);
-      if (!ascending) {
-        // Already consumed DESC
-      } else {
-        match(TokenType::ASC);  // Optional ASC
+      if (ascending) {
+        match(TokenType::ASC);
       }
-      stmt->add_order_by_column(expr, ascending);
+      stmt.add_order_by_column(expr, ascending);
     } while (match(TokenType::COMMA));
   }
-
-  // Parse LIMIT clause
   if (check(TokenType::IDENTIFIER) && peek().get_lexeme() == "LIMIT") {
     advance();
     if (check(TokenType::NUMBER)) {
-      stmt->set_limit(std::stoi(advance().get_lexeme()));
+      stmt.set_limit(std::stoi(advance().get_lexeme()));
     }
   }
-
-  // Parse OFFSET clause
   if (check(TokenType::IDENTIFIER) && peek().get_lexeme() == "OFFSET") {
     advance();
     if (check(TokenType::NUMBER)) {
-      stmt->set_offset(std::stoi(advance().get_lexeme()));
+      stmt.set_offset(std::stoi(advance().get_lexeme()));
     }
   }
+}
 
+void Parser::parse_order_limit_clauses(SetOperationStatement &stmt) {
+  if (match(TokenType::ORDER)) {
+    consume(TokenType::BY, "Expected BY");
+    do {
+      auto expr = parse_expression();
+      bool ascending = !match(TokenType::DESC);
+      if (ascending) {
+        match(TokenType::ASC);
+      }
+      stmt.add_order_by_column(expr, ascending);
+    } while (match(TokenType::COMMA));
+  }
+  if (check(TokenType::IDENTIFIER) && peek().get_lexeme() == "LIMIT") {
+    advance();
+    if (check(TokenType::NUMBER)) {
+      stmt.set_limit(std::stoi(advance().get_lexeme()));
+    }
+  }
+  if (check(TokenType::IDENTIFIER) && peek().get_lexeme() == "OFFSET") {
+    advance();
+    if (check(TokenType::NUMBER)) {
+      stmt.set_offset(std::stoi(advance().get_lexeme()));
+    }
+  }
+}
+
+bool Parser::match_set_operation(SetOperationKind &kind, bool &isAll) {
+  if (match(TokenType::UNION)) {
+    kind = SetOperationKind::Union;
+    isAll = match(TokenType::ALL);
+    return true;
+  }
+  if (match(TokenType::INTERSECT)) {
+    kind = SetOperationKind::Intersect;
+    isAll = false;
+    if (match(TokenType::ALL)) {
+      throw ParseException(
+          get_error_message("INTERSECT ALL is not supported"));
+    }
+    return true;
+  }
+  if (match(TokenType::EXCEPT)) {
+    kind = SetOperationKind::Except;
+    isAll = false;
+    if (match(TokenType::ALL)) {
+      throw ParseException(get_error_message("EXCEPT ALL is not supported"));
+    }
+    return true;
+  }
+  return false;
+}
+
+SetOperationStatement::Operand Parser::parse_query_primary() {
+  if (match(TokenType::LPAREN)) {
+    SetOperationStatement::Operand inner = parse_query_inner();
+    consume(TokenType::RPAREN, "Expected )");
+    return inner;
+  }
+  return parse_select_core();
+}
+
+SetOperationStatement::Operand Parser::parse_query_inner() {
+  SetOperationStatement::Operand left = parse_query_primary();
+  SetOperationKind kind = SetOperationKind::Union;
+  bool isAll = false;
+  while (match_set_operation(kind, isAll)) {
+    SetOperationStatement::Operand right = parse_query_primary();
+    left = std::make_shared<SetOperationStatement>(std::move(left), kind,
+                                                   std::move(right), isAll);
+  }
+  return left;
+}
+
+ParsedStatement Parser::parse_query_statement() {
+  SetOperationStatement::Operand root = parse_query_inner();
+  if (auto select = std::get_if<std::shared_ptr<SelectStatement>>(&root)) {
+    parse_order_limit_clauses(**select);
+    return *select;
+  }
+  auto setOp = std::get<std::shared_ptr<SetOperationStatement>>(root);
+  parse_order_limit_clauses(*setOp);
+  return setOp;
+}
+
+std::shared_ptr<SelectStatement> Parser::parse_select_statement() {
+  auto stmt = parse_select_core();
+  parse_order_limit_clauses(*stmt);
   return stmt;
 }
 
@@ -397,27 +508,9 @@ std::shared_ptr<InsertStatement> Parser::parse_insert_statement() {
 
   do {
     consume(TokenType::LPAREN, "Expected (");
-    std::vector<Value> values;
+    std::vector<ExpressionPtr> values;
     do {
-      if (match(TokenType::NULL_KW)) {
-        values.push_back(Value());
-      } else {
-        bool is_negative = match(TokenType::MINUS);
-        if (check(TokenType::NUMBER)) {
-          std::string numStr = advance().get_lexeme();
-          if (numStr.find('.') != std::string::npos) {
-            double number = std::stod(numStr);
-            values.push_back(Value(is_negative ? -number : number));
-          } else {
-            int64_t number = static_cast<int64_t>(std::stoll(numStr));
-            values.push_back(Value(is_negative ? -number : number));
-          }
-        } else if (!is_negative && check(TokenType::STRING)) {
-          values.push_back(Value(advance().get_lexeme()));
-        } else {
-          throw ParseException("Expected value in INSERT");
-        }
-      }
+      values.push_back(parse_expression());
     } while (match(TokenType::COMMA));
     consume(TokenType::RPAREN, "Expected )");
     stmt->add_values(values);
@@ -471,6 +564,64 @@ std::shared_ptr<CreateTableStatement> Parser::parse_create_table_statement() {
   std::string table =
       consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
   auto stmt = std::make_shared<CreateTableStatement>(table);
+  if (match(TokenType::PARTITION)) {
+    consume(TokenType::OF, "Expected OF after PARTITION");
+    const std::string parent =
+        consume(TokenType::IDENTIFIER, "Expected parent table name").get_lexeme();
+    consume(TokenType::FOR, "Expected FOR");
+    consume(TokenType::VALUES, "Expected VALUES");
+    PartitionBound bound;
+    if (match(TokenType::FROM)) {
+      consume(TokenType::LPAREN, "Expected ( after FROM");
+      ExpressionPtr minExpr = parse_expression();
+      auto minLit = std::dynamic_pointer_cast<LiteralExpression>(minExpr);
+      if (!minLit) {
+        throw ParseException(
+            get_error_message("Expected literal in FROM (...)"));
+      }
+      consume(TokenType::RPAREN, "Expected ) after FROM value");
+      consume(TokenType::TO, "Expected TO");
+      consume(TokenType::LPAREN, "Expected ( after TO");
+      ExpressionPtr maxExpr = parse_expression();
+      auto maxLit = std::dynamic_pointer_cast<LiteralExpression>(maxExpr);
+      if (!maxLit) {
+        throw ParseException(get_error_message("Expected literal in TO (...)"));
+      }
+      consume(TokenType::RPAREN, "Expected ) after TO value");
+      RangePartitionBound range;
+      range.minInclusive = minLit->get_value();
+      range.maxExclusive = maxLit->get_value();
+      bound.range = range;
+    } else if (match(TokenType::WITH)) {
+      consume(TokenType::LPAREN, "Expected ( after WITH");
+      consume(TokenType::MODULUS, "Expected MODULUS");
+      ExpressionPtr modulusExpr = parse_expression();
+      auto modulusLit =
+          std::dynamic_pointer_cast<LiteralExpression>(modulusExpr);
+      if (!modulusLit || !modulusLit->get_value().is_int()) {
+        throw ParseException(get_error_message("Expected integer MODULUS"));
+      }
+      consume(TokenType::COMMA, "Expected comma after MODULUS");
+      consume(TokenType::REMAINDER, "Expected REMAINDER");
+      ExpressionPtr remainderExpr = parse_expression();
+      auto remainderLit =
+          std::dynamic_pointer_cast<LiteralExpression>(remainderExpr);
+      if (!remainderLit || !remainderLit->get_value().is_int()) {
+        throw ParseException(get_error_message("Expected integer REMAINDER"));
+      }
+      consume(TokenType::RPAREN, "Expected ) after REMAINDER");
+      HashPartitionBound hash;
+      hash.modulus = modulusLit->get_value().as_int();
+      hash.remainder = remainderLit->get_value().as_int();
+      bound.hash = hash;
+    } else {
+      throw ParseException(
+          get_error_message("Expected FROM or WITH after FOR VALUES"));
+    }
+    stmt->setPartitionOf(parent, bound);
+    match(TokenType::SEMICOLON);
+    return stmt;
+  }
   consume(TokenType::LPAREN, "Expected (");
   do {
     if (check(TokenType::CHECK) ||
@@ -513,6 +664,24 @@ std::shared_ptr<CreateTableStatement> Parser::parse_create_table_statement() {
     }
   } while (match(TokenType::COMMA));
   consume(TokenType::RPAREN, "Expected )");
+  if (match(TokenType::PARTITION)) {
+    consume(TokenType::BY, "Expected BY after PARTITION");
+    PartitionKind kind = PartitionKind::Range;
+    if (match(TokenType::RANGE)) {
+      kind = PartitionKind::Range;
+    } else if (match(TokenType::HASH)) {
+      kind = PartitionKind::Hash;
+    } else {
+      throw ParseException(
+          get_error_message("Expected RANGE or HASH after PARTITION BY"));
+    }
+    consume(TokenType::LPAREN, "Expected ( after partition kind");
+    const std::string keyColumn =
+        consume(TokenType::IDENTIFIER, "Expected partition key column")
+            .get_lexeme();
+    consume(TokenType::RPAREN, "Expected ) after partition key");
+    stmt->setPartitionBy(kind, keyColumn);
+  }
   match(TokenType::SEMICOLON);
   return stmt;
 }
@@ -587,6 +756,300 @@ std::shared_ptr<DropViewStatement> Parser::parse_drop_view_statement() {
       consume(TokenType::IDENTIFIER, "Expected view name").get_lexeme();
   match(TokenType::SEMICOLON);
   return std::make_shared<DropViewStatement>(view_name, if_exists);
+}
+
+std::vector<RoutineParamAst> Parser::parse_routine_param_list() {
+  std::vector<RoutineParamAst> params;
+  consume(TokenType::LPAREN, "Expected (");
+  if (!check(TokenType::RPAREN)) {
+    do {
+      RoutineParamAst param;
+      param.name =
+          consume(TokenType::IDENTIFIER, "Expected parameter name").get_lexeme();
+      param.type_name =
+          consume(TokenType::IDENTIFIER, "Expected parameter type").get_lexeme();
+      params.push_back(std::move(param));
+    } while (match(TokenType::COMMA));
+  }
+  consume(TokenType::RPAREN, "Expected )");
+  return params;
+}
+
+ExpressionPtr Parser::parse_function_body_expression() {
+  match(TokenType::RETURN);
+  ExpressionPtr body = parse_expression();
+  match(TokenType::SEMICOLON);
+  return body;
+}
+
+std::vector<std::string> Parser::split_sql_statements(
+    const std::string &body) const {
+  std::vector<std::string> statements;
+  std::string current;
+  int depth = 0;
+  bool in_string = false;
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_string) {
+      current.push_back(c);
+      if (c == '\'' && i + 1 < body.size() && body[i + 1] == '\'') {
+        current.push_back(body[++i]);
+      } else if (c == '\'') {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c == '\'') {
+      in_string = true;
+      current.push_back(c);
+      continue;
+    }
+    if (c == '(') {
+      ++depth;
+    } else if (c == ')') {
+      --depth;
+    }
+    if (c == ';' && depth == 0) {
+      size_t start = 0;
+      while (start < current.size() &&
+             std::isspace(static_cast<unsigned char>(current[start]))) {
+        ++start;
+      }
+      size_t end = current.size();
+      while (end > start &&
+             std::isspace(static_cast<unsigned char>(current[end - 1]))) {
+        --end;
+      }
+      if (end > start) {
+        statements.push_back(current.substr(start, end - start));
+      }
+      current.clear();
+      continue;
+    }
+    current.push_back(c);
+  }
+  size_t start = 0;
+  while (start < current.size() &&
+         std::isspace(static_cast<unsigned char>(current[start]))) {
+    ++start;
+  }
+  size_t end = current.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(current[end - 1]))) {
+    --end;
+  }
+  if (end > start) {
+    statements.push_back(current.substr(start, end - start));
+  }
+  return statements;
+}
+
+std::string Parser::trim_original_sql() const {
+  std::string sql = original_sql_;
+  while (!sql.empty() &&
+         (sql.back() == '\n' || sql.back() == '\r' || sql.back() == ' ' ||
+          sql.back() == '\t')) {
+    sql.pop_back();
+  }
+  return sql;
+}
+
+std::shared_ptr<CreateFunctionStatement>
+Parser::parse_create_function_statement() {
+  consume(TokenType::CREATE, "Expected CREATE");
+  consume(TokenType::FUNCTION, "Expected FUNCTION");
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected function name").get_lexeme();
+  std::vector<RoutineParamAst> params = parse_routine_param_list();
+  consume(TokenType::RETURNS, "Expected RETURNS");
+  std::string return_type =
+      consume(TokenType::IDENTIFIER, "Expected return type").get_lexeme();
+  consume(TokenType::AS, "Expected AS");
+  ExpressionPtr body;
+  if (check(TokenType::DOLLAR_QUOTED_STRING)) {
+    const std::string body_text = advance().get_lexeme();
+    Parser body_parser(body_text);
+    body = body_parser.parse_function_body_expression();
+  } else {
+    body = parse_expression();
+  }
+  match(TokenType::SEMICOLON);
+  try {
+    (void)string_to_data_type(return_type);
+    for (const RoutineParamAst &param : params) {
+      (void)string_to_data_type(param.type_name);
+    }
+  } catch (const std::exception &ex) {
+    throw ParseException(get_error_message(ex.what()));
+  }
+  return std::make_shared<CreateFunctionStatement>(
+      std::move(name), std::move(params), std::move(return_type),
+      std::move(body), trim_original_sql());
+}
+
+std::shared_ptr<DropFunctionStatement> Parser::parse_drop_function_statement() {
+  consume(TokenType::DROP, "Expected DROP");
+  consume(TokenType::FUNCTION, "Expected FUNCTION");
+  bool if_exists = false;
+  if (match(TokenType::IF)) {
+    consume(TokenType::EXISTS, "Expected EXISTS after IF");
+    if_exists = true;
+  }
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected function name").get_lexeme();
+  match(TokenType::SEMICOLON);
+  return std::make_shared<DropFunctionStatement>(std::move(name), if_exists);
+}
+
+std::shared_ptr<CreateProcedureStatement>
+Parser::parse_create_procedure_statement() {
+  consume(TokenType::CREATE, "Expected CREATE");
+  consume(TokenType::PROCEDURE, "Expected PROCEDURE");
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected procedure name").get_lexeme();
+  std::vector<RoutineParamAst> params = parse_routine_param_list();
+  consume(TokenType::AS, "Expected AS");
+  if (!check(TokenType::DOLLAR_QUOTED_STRING)) {
+    throw ParseException(
+        get_error_message("Expected $$ ... $$ body for CREATE PROCEDURE"));
+  }
+  const std::string body_text = advance().get_lexeme();
+  std::vector<std::string> statements = split_sql_statements(body_text);
+  if (statements.empty()) {
+    throw ParseException(get_error_message("Procedure body is empty"));
+  }
+  for (const std::string &stmt_sql : statements) {
+    Parser check_parser(stmt_sql);
+    (void)check_parser.parse_statement();
+  }
+  match(TokenType::SEMICOLON);
+  try {
+    for (const RoutineParamAst &param : params) {
+      (void)string_to_data_type(param.type_name);
+    }
+  } catch (const std::exception &ex) {
+    throw ParseException(get_error_message(ex.what()));
+  }
+  return std::make_shared<CreateProcedureStatement>(
+      std::move(name), std::move(params), std::move(statements),
+      trim_original_sql());
+}
+
+std::shared_ptr<DropProcedureStatement>
+Parser::parse_drop_procedure_statement() {
+  consume(TokenType::DROP, "Expected DROP");
+  consume(TokenType::PROCEDURE, "Expected PROCEDURE");
+  bool if_exists = false;
+  if (match(TokenType::IF)) {
+    consume(TokenType::EXISTS, "Expected EXISTS after IF");
+    if_exists = true;
+  }
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected procedure name").get_lexeme();
+  match(TokenType::SEMICOLON);
+  return std::make_shared<DropProcedureStatement>(std::move(name), if_exists);
+}
+
+std::shared_ptr<CallStatement> Parser::parse_call_statement() {
+  consume(TokenType::CALL, "Expected CALL");
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected procedure name").get_lexeme();
+  consume(TokenType::LPAREN, "Expected (");
+  std::vector<ExpressionPtr> args;
+  if (!check(TokenType::RPAREN)) {
+    do {
+      args.push_back(parse_expression());
+    } while (match(TokenType::COMMA));
+  }
+  consume(TokenType::RPAREN, "Expected )");
+  match(TokenType::SEMICOLON);
+  return std::make_shared<CallStatement>(std::move(name), std::move(args));
+}
+
+std::shared_ptr<CreateTriggerStatement>
+Parser::parse_create_trigger_statement() {
+  consume(TokenType::CREATE, "Expected CREATE");
+  consume(TokenType::TRIGGER, "Expected TRIGGER");
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected trigger name").get_lexeme();
+  TriggerTiming timing;
+  if (match(TokenType::BEFORE)) {
+    timing = TriggerTiming::Before;
+  } else if (match(TokenType::AFTER)) {
+    timing = TriggerTiming::After;
+  } else {
+    throw ParseException(get_error_message("Expected BEFORE or AFTER"));
+  }
+  TriggerEvent event;
+  if (match(TokenType::INSERT)) {
+    event = TriggerEvent::Insert;
+  } else if (match(TokenType::UPDATE)) {
+    event = TriggerEvent::Update;
+  } else if (match(TokenType::DELETE)) {
+    event = TriggerEvent::Delete;
+  } else {
+    throw ParseException(
+        get_error_message("Expected INSERT, UPDATE, or DELETE"));
+  }
+  consume(TokenType::ON, "Expected ON");
+  std::string table_name =
+      consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
+  consume(TokenType::FOR, "Expected FOR");
+  consume(TokenType::EACH, "Expected EACH");
+  consume(TokenType::ROW, "Expected ROW");
+  consume(TokenType::EXECUTE, "Expected EXECUTE");
+  if (!check(TokenType::DOLLAR_QUOTED_STRING)) {
+    throw ParseException(
+        get_error_message("Expected $$ ... $$ body for CREATE TRIGGER"));
+  }
+  const std::string body_text = advance().get_lexeme();
+  std::vector<std::string> statements = split_sql_statements(body_text);
+  if (statements.empty()) {
+    throw ParseException(get_error_message("Trigger body is empty"));
+  }
+  for (const std::string &stmt_sql : statements) {
+    Parser check_parser(stmt_sql);
+    (void)check_parser.parse_statement();
+  }
+  match(TokenType::SEMICOLON);
+  return std::make_shared<CreateTriggerStatement>(
+      std::move(name), std::move(table_name), timing, event,
+      std::move(statements), trim_original_sql());
+}
+
+std::shared_ptr<DropTriggerStatement> Parser::parse_drop_trigger_statement() {
+  consume(TokenType::DROP, "Expected DROP");
+  consume(TokenType::TRIGGER, "Expected TRIGGER");
+  bool if_exists = false;
+  if (match(TokenType::IF)) {
+    consume(TokenType::EXISTS, "Expected EXISTS after IF");
+    if_exists = true;
+  }
+  std::string name =
+      consume(TokenType::IDENTIFIER, "Expected trigger name").get_lexeme();
+  match(TokenType::SEMICOLON);
+  return std::make_shared<DropTriggerStatement>(std::move(name), if_exists);
+}
+
+std::shared_ptr<SetNewStatement> Parser::parse_set_new_statement() {
+  consume(TokenType::SET, "Expected SET");
+  Token new_token =
+      consume(TokenType::IDENTIFIER, "Expected NEW after SET");
+  std::string new_lexeme = new_token.get_lexeme();
+  for (char &c : new_lexeme) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (new_lexeme != "NEW") {
+    throw ParseException(get_error_message("Expected NEW after SET"));
+  }
+  consume(TokenType::DOT, "Expected . after NEW");
+  std::string column_name =
+      consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme();
+  consume(TokenType::EQUAL, "Expected =");
+  ExpressionPtr value = parse_expression();
+  match(TokenType::SEMICOLON);
+  return std::make_shared<SetNewStatement>(std::move(column_name),
+                                           std::move(value));
 }
 
 ColumnDefinition Parser::parse_column_definition() {
@@ -1102,7 +1565,7 @@ ExpressionPtr Parser::parse_multiplicative_expression() {
   auto expr = parse_unary_expression();
 
   while (true) {
-    if (match(TokenType::MULTIPLY)) {
+    if (match(TokenType::MULTIPLY) || match(TokenType::ASTERISK)) {
       auto right = parse_unary_expression();
       expr = std::make_shared<BinaryOpExpression>(
           expr, BinaryOpExpression::Operator::MUL, right);
@@ -1186,8 +1649,27 @@ ExpressionPtr Parser::parse_primary_expression() {
 
 ExpressionPtr Parser::parse_identifier_or_function() {
   std::string name = advance().get_lexeme();
-
-  // Check for function call
+  std::string upper_name = name;
+  for (char &c : upper_name) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (upper_name == "CAST" && match(TokenType::LPAREN)) {
+    ExpressionPtr inner = parse_expression();
+    consume(TokenType::AS, "Expected AS in CAST");
+    std::string type_name =
+        consume(TokenType::IDENTIFIER, "Expected type in CAST").get_lexeme();
+    consume(TokenType::RPAREN, "Expected ) after CAST");
+    try {
+      return std::make_shared<CastExpression>(
+          inner, string_to_data_type(type_name));
+    } catch (const std::exception &ex) {
+      throw ParseException(get_error_message(ex.what()));
+    }
+  }
+  if (upper_name == "CURRENT_DATE" && !check(TokenType::LPAREN)) {
+    return std::make_shared<FunctionCallExpression>("current_date",
+                                                    std::vector<ExpressionPtr>{});
+  }
   if (check(TokenType::LPAREN)) {
     advance();
     std::vector<ExpressionPtr> args;
@@ -1197,21 +1679,46 @@ ExpressionPtr Parser::parse_identifier_or_function() {
       } while (match(TokenType::COMMA));
     }
     consume(TokenType::RPAREN, "Expected )");
-    return std::make_shared<FunctionCallExpression>(name, args);
+    auto fn = std::make_shared<FunctionCallExpression>(name, args);
+    if (match(TokenType::OVER)) {
+      fn->set_window_spec(parse_window_spec());
+    }
+    return fn;
   }
-
-  // Check for column reference (table.column)
   if (match(TokenType::DOT)) {
     std::string column = advance().get_lexeme();
     return std::make_shared<ColumnRefExpression>(name, column);
   }
-
-  // Just a column reference
   if (name == "*") {
     return std::make_shared<IdentifierExpression>("*");
   }
-
   return std::make_shared<ColumnRefExpression>(name);
+}
+
+std::shared_ptr<WindowSpec> Parser::parse_window_spec() {
+  consume(TokenType::LPAREN, "Expected ( after OVER");
+  auto spec = std::make_shared<WindowSpec>();
+  if (match(TokenType::PARTITION)) {
+    consume(TokenType::BY, "Expected BY after PARTITION");
+    do {
+      spec->add_partition_by(parse_expression());
+    } while (match(TokenType::COMMA));
+  }
+  if (!match(TokenType::ORDER)) {
+    throw ParseException(
+        get_error_message("Window OVER requires ORDER BY in v1"));
+  }
+  consume(TokenType::BY, "Expected BY after ORDER");
+  do {
+    ExpressionPtr expr = parse_expression();
+    bool ascending = !match(TokenType::DESC);
+    if (ascending) {
+      match(TokenType::ASC);
+    }
+    spec->add_order_by(expr, ascending);
+  } while (match(TokenType::COMMA));
+  consume(TokenType::RPAREN, "Expected ) after window specification");
+  return spec;
 }
 
 std::string Parser::get_error_message(const std::string &message) const {

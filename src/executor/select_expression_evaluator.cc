@@ -1,7 +1,13 @@
 #include "executor/select_expression_evaluator.h"
 
 #include <algorithm>
+#include <cctype>
 #include <sstream>
+
+#include "executor/scalar_function.h"
+#include "core/routine_catalog.h"
+#include "executor/select_analysis.h"
+#include "types/type_converter.h"
 
 namespace db {
 
@@ -46,6 +52,9 @@ std::optional<std::string> validate_inner(const ExpressionPtr &expr,
       if (auto e = validate_inner(arg, ev)) return e;
     }
     return std::nullopt;
+  }
+  if (auto cast_expr = std::dynamic_pointer_cast<CastExpression>(expr)) {
+    return validate_inner(cast_expr->get_expression(), ev);
   }
   if (auto cs = std::dynamic_pointer_cast<CaseExpression>(expr)) {
     for (const auto &[when, then] : cs->get_when_then_pairs()) {
@@ -107,6 +116,16 @@ void SelectExpressionEvaluator::set_correlation_context(
 
 void SelectExpressionEvaluator::set_bind_context(const BindContext *context) {
   bind_context_ = context;
+}
+
+void SelectExpressionEvaluator::set_routine_catalog(
+    const RoutineCatalog *catalog) {
+  routine_catalog_ = catalog;
+}
+
+void SelectExpressionEvaluator::set_local_variables(
+    std::unordered_map<std::string, Value> locals) {
+  local_variables_ = std::move(locals);
 }
 
 std::optional<Value> SelectExpressionEvaluator::lookup_correlated(
@@ -390,6 +409,12 @@ Value SelectExpressionEvaluator::evaluate_expression(
   }
   auto col_ref = std::dynamic_pointer_cast<ColumnRefExpression>(expr);
   if (col_ref) {
+    if (col_ref->get_table().empty()) {
+      auto local_it = local_variables_.find(col_ref->get_column());
+      if (local_it != local_variables_.end()) {
+        return local_it->second;
+      }
+    }
     std::string err;
     int idx = resolve_column_index(*col_ref, &err);
     if (idx < 0) {
@@ -456,11 +481,33 @@ Value SelectExpressionEvaluator::evaluate_expression(
       return Value();
     }
   }
+  auto cast_expr = std::dynamic_pointer_cast<CastExpression>(expr);
+  if (cast_expr) {
+    Value inner =
+        evaluate_expression(row, cast_expr->get_expression(), error_msg);
+    if (inner.is_null()) {
+      return Value();
+    }
+    try {
+      return TypeConverter::string_to_value(inner.to_string(),
+                                            cast_expr->get_target_type());
+    } catch (const std::exception &ex) {
+      if (error_msg) {
+        *error_msg = ex.what();
+      }
+      return Value();
+    }
+  }
   auto func = std::dynamic_pointer_cast<FunctionCallExpression>(expr);
   if (func) {
-    auto func_name = func->get_function_name();
+    if (func->is_windowed()) {
+      return Value();
+    }
+    std::string func_name = func->get_function_name();
     std::transform(func_name.begin(), func_name.end(), func_name.begin(),
-                   ::tolower);
+                   [](unsigned char c) {
+                     return static_cast<char>(std::tolower(c));
+                   });
     const auto &args = func->get_arguments();
     if (func_name == "count" || func_name == "sum" || func_name == "avg" ||
         func_name == "min" || func_name == "max") {
@@ -469,22 +516,46 @@ Value SelectExpressionEvaluator::evaluate_expression(
       }
       return Value();
     }
-    if (func_name == "upper" && !args.empty()) {
-      Value val = evaluate_expression(row, args[0], error_msg);
-      std::string str = val.as_string();
-      std::transform(str.begin(), str.end(), str.begin(), ::toupper);
-      return Value(str);
+    std::vector<Value> values;
+    values.reserve(args.size());
+    for (const auto &arg : args) {
+      values.push_back(evaluate_expression(row, arg, error_msg));
+      if (error_msg && !error_msg->empty()) {
+        return Value();
+      }
     }
-    if (func_name == "lower" && !args.empty()) {
-      Value val = evaluate_expression(row, args[0], error_msg);
-      std::string str = val.as_string();
-      std::transform(str.begin(), str.end(), str.begin(), ::tolower);
-      return Value(str);
+    if (ScalarFunctionRegistry::instance().hasFunction(func_name)) {
+      return ScalarFunctionRegistry::instance().evaluate(func_name, values,
+                                                         error_msg);
     }
-    if (func_name == "length" && !args.empty()) {
-      Value val = evaluate_expression(row, args[0], error_msg);
-      return Value(static_cast<int64_t>(val.as_string().length()));
+    if (routine_catalog_) {
+      const FunctionDefinition *udf = routine_catalog_->getFunction(func_name);
+      if (!udf) {
+        // try original case-sensitive name from AST
+        udf = routine_catalog_->getFunction(func->get_function_name());
+      }
+      if (udf) {
+        if (values.size() != udf->getParams().size()) {
+          if (error_msg) {
+            *error_msg = "Wrong number of arguments for function " +
+                         udf->getName();
+          }
+          return Value();
+        }
+        std::unordered_map<std::string, Value> locals;
+        for (size_t i = 0; i < udf->getParams().size(); ++i) {
+          locals[udf->getParams()[i].name] = values[i];
+        }
+        SelectExpressionEvaluator body_eval({});
+        body_eval.set_routine_catalog(routine_catalog_);
+        body_eval.set_local_variables(std::move(locals));
+        return body_eval.evaluate_expression(Row(), udf->getBody(), error_msg);
+      }
     }
+    if (error_msg) {
+      *error_msg = "Unknown function: " + func_name;
+    }
+    return Value();
   }
   return Value();
 }

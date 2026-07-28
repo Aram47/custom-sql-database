@@ -7,6 +7,7 @@
 
 #include "core/check_constraint.h"
 #include "core/foreign_key.h"
+#include "storage/page_format.h"
 #include "types/type_converter.h"
 #include "utils/logger.h"
 
@@ -106,18 +107,18 @@ void PersistenceManager::save_table(const Table &table,
         write_string(file, check.name);
         write_string(file, check.expression_text);
       }
-      uint32_t row_count = static_cast<uint32_t>(table.get_row_count());
-      file.write(reinterpret_cast<const char *>(&row_count), sizeof(row_count));
-      const auto &rows = table.get_all_rows();
-      for (const auto &row : rows) {
-        for (size_t i = 0; i < col_count; ++i) {
-          auto serialized = TypeConverter::serialize_value(row.get_value(i));
-          uint32_t value_len = static_cast<uint32_t>(serialized.size());
-          file.write(reinterpret_cast<const char *>(&value_len),
-                     sizeof(value_len));
-          file.write(reinterpret_cast<const char *>(serialized.data()),
-                     value_len);
+      const_cast<Table &>(table).flush_heap();
+      const std::vector<std::vector<uint8_t>> pages =
+          table.get_heap().get_page_store().export_pages();
+      uint32_t page_count = static_cast<uint32_t>(pages.size());
+      file.write(reinterpret_cast<const char *>(&page_count),
+                 sizeof(page_count));
+      for (const auto &page : pages) {
+        if (page.size() != kPageSize) {
+          throw StorageException("Invalid page size while saving table");
         }
+        file.write(reinterpret_cast<const char *>(page.data()),
+                   static_cast<std::streamsize>(kPageSize));
       }
       file.flush();
       if (!file) {
@@ -243,21 +244,38 @@ std::unique_ptr<Table> PersistenceManager::load_table(
         table->set_checks(std::move(checks));
       }
     }
-    uint32_t row_count = 0;
-    file.read(reinterpret_cast<char *>(&row_count), sizeof(row_count));
-    for (uint32_t i = 0; i < row_count; ++i) {
-      Row row;
-      for (uint32_t j = 0; j < col_count; ++j) {
-        uint32_t value_len = 0;
-        file.read(reinterpret_cast<char *>(&value_len), sizeof(value_len));
-        std::vector<uint8_t> serialized(value_len);
-        file.read(reinterpret_cast<char *>(serialized.data()), value_len);
-        const auto &col = table->get_column(j);
-        Value value =
-            TypeConverter::deserialize_value(serialized, col.get_type());
-        row.add_value(value);
+    if (version >= 6) {
+      uint32_t page_count = 0;
+      file.read(reinterpret_cast<char *>(&page_count), sizeof(page_count));
+      std::vector<std::vector<uint8_t>> pages;
+      pages.reserve(page_count);
+      for (uint32_t i = 0; i < page_count; ++i) {
+        std::vector<uint8_t> page(kPageSize);
+        file.read(reinterpret_cast<char *>(page.data()),
+                  static_cast<std::streamsize>(kPageSize));
+        if (!file) {
+          throw StorageException("Truncated page data in " + file_path);
+        }
+        pages.push_back(std::move(page));
       }
-      table->insert_row(row);
+      table->replace_heap_pages(pages);
+    } else {
+      uint32_t row_count = 0;
+      file.read(reinterpret_cast<char *>(&row_count), sizeof(row_count));
+      for (uint32_t i = 0; i < row_count; ++i) {
+        Row row;
+        for (uint32_t j = 0; j < col_count; ++j) {
+          uint32_t value_len = 0;
+          file.read(reinterpret_cast<char *>(&value_len), sizeof(value_len));
+          std::vector<uint8_t> serialized(value_len);
+          file.read(reinterpret_cast<char *>(serialized.data()), value_len);
+          const auto &col = table->get_column(j);
+          Value value =
+              TypeConverter::deserialize_value(serialized, col.get_type());
+          row.add_value(value);
+        }
+        table->insert_row(row);
+      }
     }
     file.close();
     table->rebuild_indexes();

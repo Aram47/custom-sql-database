@@ -8,17 +8,25 @@
 
 namespace db {
 
+/** Process role for standalone, worker, or coordinator mode. */
+enum class ServerRole { Standalone, Worker, Coordinator };
+
 /** Parsed server command-line options. */
 struct CliOptions {
   int port{9000};
   size_t workers{4};
   std::string data_directory{"data"};
+  size_t buffer_pool_pages{64};
   LogLevel log_level{LogLevel::Info};
   bool show_help{false};
   std::optional<std::string> auth_file;
   /** Tri-state: nullopt = default (true when auth_file set). */
   std::optional<bool> require_auth;
   std::optional<std::string> bootstrap_admin_password;
+  ServerRole role{ServerRole::Standalone};
+  std::optional<int> shard_id;
+  std::optional<std::string> shard_map_path;
+  std::optional<std::string> rpc_secret;
 
   /** Effective require-auth after applying defaults. */
   bool effective_require_auth() const {

@@ -40,6 +40,19 @@ class SessionContext {
   void set_role(Role role);
   void clear_auth();
 
+  int get_trigger_depth() const;
+  void enter_trigger();
+  void leave_trigger();
+
+  /** Coordinator TX: shard pinned by the first routed statement. */
+  std::optional<int> get_pinned_shard_id() const;
+  void set_pinned_shard_id(int shardId);
+  void clear_pinned_shard_id();
+
+  /** True after coordinator forwarded BEGIN to the pinned worker. */
+  bool has_remote_transaction_started() const;
+  void set_remote_transaction_started(bool started);
+
  private:
   uint64_t session_id_;
   bool in_transaction_{false};
@@ -49,6 +62,9 @@ class SessionContext {
   bool authenticated_{false};
   std::string username_;
   std::optional<Role> role_;
+  int trigger_depth_{0};
+  std::optional<int> pinned_shard_id_;
+  bool remote_transaction_started_{false};
 };
 
 }  // namespace db

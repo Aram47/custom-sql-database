@@ -82,4 +82,35 @@ void SessionContext::clear_auth() {
   role_.reset();
 }
 
+int SessionContext::get_trigger_depth() const { return trigger_depth_; }
+
+void SessionContext::enter_trigger() { ++trigger_depth_; }
+
+void SessionContext::leave_trigger() {
+  if (trigger_depth_ > 0) {
+    --trigger_depth_;
+  }
+}
+
+std::optional<int> SessionContext::get_pinned_shard_id() const {
+  return pinned_shard_id_;
+}
+
+void SessionContext::set_pinned_shard_id(int shardId) {
+  pinned_shard_id_ = shardId;
+}
+
+void SessionContext::clear_pinned_shard_id() {
+  pinned_shard_id_.reset();
+  remote_transaction_started_ = false;
+}
+
+bool SessionContext::has_remote_transaction_started() const {
+  return remote_transaction_started_;
+}
+
+void SessionContext::set_remote_transaction_started(bool started) {
+  remote_transaction_started_ = started;
+}
+
 }  // namespace db

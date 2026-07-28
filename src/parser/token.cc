@@ -139,6 +139,52 @@ std::string Token::token_type_to_string(TokenType type) {
       return "EXPLAIN";
     case TokenType::CHECK:
       return "CHECK";
+    case TokenType::UNION:
+      return "UNION";
+    case TokenType::INTERSECT:
+      return "INTERSECT";
+    case TokenType::EXCEPT:
+      return "EXCEPT";
+    case TokenType::ALL:
+      return "ALL";
+    case TokenType::OVER:
+      return "OVER";
+    case TokenType::PARTITION:
+      return "PARTITION";
+    case TokenType::RANGE:
+      return "RANGE";
+    case TokenType::HASH:
+      return "HASH";
+    case TokenType::OF:
+      return "OF";
+    case TokenType::FOR:
+      return "FOR";
+    case TokenType::WITH:
+      return "WITH";
+    case TokenType::MODULUS:
+      return "MODULUS";
+    case TokenType::REMAINDER:
+      return "REMAINDER";
+    case TokenType::FUNCTION:
+      return "FUNCTION";
+    case TokenType::RETURNS:
+      return "RETURNS";
+    case TokenType::RETURN:
+      return "RETURN";
+    case TokenType::PROCEDURE:
+      return "PROCEDURE";
+    case TokenType::CALL:
+      return "CALL";
+    case TokenType::TRIGGER:
+      return "TRIGGER";
+    case TokenType::BEFORE:
+      return "BEFORE";
+    case TokenType::AFTER:
+      return "AFTER";
+    case TokenType::EACH:
+      return "EACH";
+    case TokenType::ROW:
+      return "ROW";
     case TokenType::COUNT:
       return "COUNT";
     case TokenType::SUM:
@@ -191,6 +237,8 @@ std::string Token::token_type_to_string(TokenType type) {
       return "NUMBER";
     case TokenType::STRING:
       return "STRING";
+    case TokenType::DOLLAR_QUOTED_STRING:
+      return "DOLLAR_QUOTED_STRING";
     case TokenType::END_OF_INPUT:
       return "EOF";
     case TokenType::UNKNOWN:

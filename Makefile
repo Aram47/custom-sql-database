@@ -1,4 +1,4 @@
-.PHONY: all build server client run client-run demo tests test clean data-clean distclean help
+.PHONY: all build server client backup-tool run client-run demo demo-shard backup restore tests test clean data-clean distclean help
 
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -Iinclude
@@ -28,7 +28,9 @@ INCLUDE_DIR := include
 BUILD_DIR := build
 BIN_DIR := bin
 CLIENT_DIR := client
+TOOLS_DIR := tools
 DATA_DIR := data
+BACKUP_DIR := backup
 PLATFORM_DIR_PATH := platform/$(PLATFORM_DIR)
 
 SOURCES := $(shell find $(SRC_DIR) -name "*.cc" ! -path "$(SRC_DIR)/platform/*")
@@ -37,6 +39,7 @@ COMMON_PLATFORM_SOURCES := $(SRC_DIR)/platform/tcp_client.cc
 
 MAIN_SOURCE := main.cc
 CLIENT_SOURCE := $(CLIENT_DIR)/cli_client.cc
+BACKUP_SOURCE := $(TOOLS_DIR)/db_backup.cc
 
 OBJECTS := $(SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
 PLATFORM_OBJECTS := $(PLATFORM_SOURCES:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
@@ -45,6 +48,7 @@ MAIN_OBJ := $(BUILD_DIR)/main.o
 
 SERVER_BIN := $(BIN_DIR)/nobugdb
 CLIENT_BIN := $(BIN_DIR)/nobugdb-cli
+BACKUP_BIN := $(BIN_DIR)/db_backup
 
 # Google Test (git submodule: third_party/googletest)
 GTEST_ROOT := third_party/googletest/googletest
@@ -74,10 +78,24 @@ build: server
 client: $(CLIENT_BIN)
 	@echo "✓ NoBugDB client built successfully ($(PLATFORM_DIR))"
 
+backup-tool: $(BACKUP_BIN)
+	@echo "✓ NoBugDB backup tool built successfully ($(PLATFORM_DIR))"
+
+backup: backup-tool
+	@mkdir -p $(BACKUP_DIR)
+	./$(BACKUP_BIN) backup --data-dir $(DATA_DIR) --output-dir $(BACKUP_DIR)
+
+restore: backup-tool
+	./$(BACKUP_BIN) restore --backup-dir $(BACKUP_DIR) --data-dir $(DATA_DIR) --force
+
 $(SERVER_BIN): $(CORE_OBJECTS) $(MAIN_OBJ) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(CLIENT_BIN): $(CLIENT_SOURCE) $(CLIENT_OBJECTS) | $(BIN_DIR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BACKUP_BIN): $(BACKUP_SOURCE) $(CORE_OBJECTS) | $(BIN_DIR)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -135,6 +153,10 @@ demo: build client
 	$(DEMO_CMD)
 	@echo "✓ Demo finished"
 
+demo-shard: build
+	@chmod +x scripts/demo_sharded_cluster.sh
+	@./scripts/demo_sharded_cluster.sh
+
 clean:
 	@rm -rf $(BUILD_DIR) $(BIN_DIR)
 	@echo "✓ Build artifacts removed"
@@ -152,8 +174,12 @@ help:
 	@echo "Targets:"
 	@echo "  make build       - Build server"
 	@echo "  make client      - Build client"
+	@echo "  make backup-tool - Build offline backup/restore CLI (bin/db_backup)"
+	@echo "  make backup      - Offline backup of DATA_DIR into BACKUP_DIR (stop server first)"
+	@echo "  make restore     - Restore BACKUP_DIR into DATA_DIR (--force)"
 	@echo "  make run         - Run server"
 	@echo "  make demo        - Run quick server+client demo"
+	@echo "  make demo-shard  - Run 2-worker + coordinator sharding demo"
 	@echo "  make tests       - Build unit/integration tests (requires submodule googletest)"
 	@echo "  make test        - Build and run tests"
 	@echo "  make clean       - Clean build artifacts"

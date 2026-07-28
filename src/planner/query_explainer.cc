@@ -6,7 +6,9 @@
 #include "core/database.h"
 #include "core/table.h"
 #include "executor/index_predicate.h"
+#include "executor/select_analysis.h"
 #include "planner/access_path_chooser.h"
+#include "planner/join_method_plan.h"
 #include "planner/join_order_planner.h"
 
 namespace db {
@@ -160,7 +162,49 @@ std::vector<std::string> QueryExplainer::explainSelect(
         orderLine << "  Join order: " << relations[order[0]].table_name << ", "
                   << relations[order[1]].table_name;
         lines.push_back(orderLine.str());
+        Table *leftTable = orderedTables[order[0]];
+        Table *rightTable = orderedTables[order[1]];
+        const std::string &leftAlias = aliases[order[0]];
+        const std::string &rightAlias = aliases[order[1]];
+        std::vector<SelectColumnBinding> leftBindings;
+        for (const auto &col : leftTable->get_columns()) {
+          leftBindings.push_back(
+              {leftAlias, leftTable->get_name(), col.get_name()});
+        }
+        const ExpressionPtr &joinOn = std::get<3>(stmt->get_joins()[0]);
+        const EquiJoinPlan equiPlan = planEquiJoinMethod(
+            database_, leftTable, rightTable, leftAlias, rightAlias, joinOn,
+            leftTable->get_row_count(), rightTable->get_row_count(),
+            leftBindings);
+        std::ostringstream methodLine;
+        methodLine << "  Join method: "
+                   << joinMethodKindName(equiPlan.method.kind);
+        lines.push_back(methodLine.str());
       }
+    }
+  } else if (table && table->isPartitioned()) {
+    const auto children =
+        database_->listPrunedPartitions(table, stmt->get_where_condition());
+    const size_t total =
+        table->getPartitionMetadata()->getPartitions().size();
+    std::ostringstream pruneLine;
+    pruneLine << "PartitionPrune on " << tableName << " -> " << children.size()
+              << " of " << total << " partitions";
+    lines.push_back(pruneLine.str());
+    for (const std::string &childName : children) {
+      Table *child = database_->get_table(childName);
+      const bool hasIndexPath =
+          hasIndexAccessPath(child, stmt->get_from_alias(),
+                             stmt->get_where_condition());
+      const size_t rowCount = child ? child->get_row_count() : 0;
+      const double selectivity =
+          rowCount == 0 ? 1.0 : 1.0 / static_cast<double>(rowCount);
+      const AccessPathChoice path =
+          AccessPathChooser::choose(rowCount, hasIndexPath, selectivity);
+      std::ostringstream scanLine;
+      scanLine << "  " << accessPathKindName(path.kind) << " on " << childName
+               << " (cost=" << path.cost << ")";
+      lines.push_back(scanLine.str());
     }
   } else {
     const bool hasIndexPath =
@@ -182,9 +226,63 @@ std::vector<std::string> QueryExplainer::explainSelect(
   if (!stmt->get_group_by_columns().empty()) {
     lines.push_back("  GroupAggregate");
   }
+  if (select_has_window(stmt)) {
+    lines.push_back("  Window");
+  }
   if (stmt->is_distinct()) {
     lines.push_back("  Distinct");
   }
+  if (!stmt->get_order_by_columns().empty()) {
+    lines.push_back("  Sort");
+  }
+  if (stmt->get_limit() > 0 || stmt->get_offset() > 0) {
+    lines.push_back("  LimitOffset");
+  }
+  return lines;
+}
+
+namespace {
+
+std::string setOperationLabel(SetOperationKind kind, bool isAll) {
+  switch (kind) {
+    case SetOperationKind::Union:
+      return isAll ? "Union All" : "Union";
+    case SetOperationKind::Intersect:
+      return "Intersect";
+    case SetOperationKind::Except:
+      return "Except";
+  }
+  return "Union";
+}
+
+void appendIndented(std::vector<std::string> &dest,
+                    const std::vector<std::string> &source) {
+  for (const std::string &line : source) {
+    dest.push_back("  " + line);
+  }
+}
+
+}  // namespace
+
+std::vector<std::string> QueryExplainer::explainSetOperation(
+    const std::shared_ptr<SetOperationStatement> &stmt) const {
+  std::vector<std::string> lines;
+  if (!stmt) {
+    lines.push_back("SetOperation (empty)");
+    return lines;
+  }
+  lines.push_back(setOperationLabel(stmt->get_kind(), stmt->is_all()));
+  auto explainOperand =
+      [&](const SetOperationStatement::Operand &operand) {
+        if (auto select =
+                std::get_if<std::shared_ptr<SelectStatement>>(&operand)) {
+          return explainSelect(*select);
+        }
+        return explainSetOperation(
+            std::get<std::shared_ptr<SetOperationStatement>>(operand));
+      };
+  appendIndented(lines, explainOperand(stmt->get_left()));
+  appendIndented(lines, explainOperand(stmt->get_right()));
   if (!stmt->get_order_by_columns().empty()) {
     lines.push_back("  Sort");
   }
@@ -205,6 +303,12 @@ std::vector<std::string> QueryExplainer::explainInsert(
   line << "Insert on " << stmt->get_table() << " (" << stmt->get_values().size()
        << " row(s))";
   lines.push_back(line.str());
+  Table *table = database_ ? database_->get_table(stmt->get_table()) : nullptr;
+  if (table && table->isPartitioned() && !stmt->get_values().empty() &&
+      !stmt->get_values()[0].empty()) {
+    lines.push_back("  PartitionRoute by " +
+                    table->getPartitionMetadata()->getKeyColumn());
+  }
   return lines;
 }
 
@@ -247,6 +351,9 @@ std::vector<std::string> QueryExplainer::buildPlanLines(
     const ParsedStatement &stmt) const {
   if (auto p = std::get_if<std::shared_ptr<SelectStatement>>(&stmt)) {
     return explainSelect(*p);
+  }
+  if (auto p = std::get_if<std::shared_ptr<SetOperationStatement>>(&stmt)) {
+    return explainSetOperation(*p);
   }
   if (auto p = std::get_if<std::shared_ptr<InsertStatement>>(&stmt)) {
     return explainInsert(*p);

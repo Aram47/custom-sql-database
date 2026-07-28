@@ -118,6 +118,46 @@ std::string UnaryOpExpression::to_string() const {
   return "(" + opStr + " " + expr_->to_string() + ")";
 }
 
+void WindowSpec::add_partition_by(ExpressionPtr expr) {
+  partition_by_.push_back(std::move(expr));
+}
+
+void WindowSpec::add_order_by(ExpressionPtr expr, bool ascending) {
+  order_by_.emplace_back(std::move(expr), ascending);
+}
+
+const std::vector<ExpressionPtr> &WindowSpec::get_partition_by() const {
+  return partition_by_;
+}
+
+const std::vector<std::pair<ExpressionPtr, bool>> &WindowSpec::get_order_by()
+    const {
+  return order_by_;
+}
+
+std::string WindowSpec::to_string() const {
+  std::ostringstream oss;
+  oss << "(";
+  if (!partition_by_.empty()) {
+    oss << "PARTITION BY ";
+    for (size_t i = 0; i < partition_by_.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << partition_by_[i]->to_string();
+    }
+  }
+  if (!order_by_.empty()) {
+    if (!partition_by_.empty()) oss << " ";
+    oss << "ORDER BY ";
+    for (size_t i = 0; i < order_by_.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << order_by_[i].first->to_string();
+      oss << (order_by_[i].second ? " ASC" : " DESC");
+    }
+  }
+  oss << ")";
+  return oss.str();
+}
+
 FunctionCallExpression::FunctionCallExpression(const std::string &name,
                                                std::vector<ExpressionPtr> args)
     : name_(name), args_(std::move(args)) {}
@@ -131,6 +171,20 @@ const std::vector<ExpressionPtr> &FunctionCallExpression::get_arguments()
   return args_;
 }
 
+void FunctionCallExpression::set_window_spec(
+    std::shared_ptr<WindowSpec> windowSpec) {
+  window_spec_ = std::move(windowSpec);
+}
+
+const std::shared_ptr<WindowSpec> &FunctionCallExpression::get_window_spec()
+    const {
+  return window_spec_;
+}
+
+bool FunctionCallExpression::is_windowed() const {
+  return static_cast<bool>(window_spec_);
+}
+
 std::string FunctionCallExpression::to_string() const {
   std::string result = name_ + "(";
   for (size_t i = 0; i < args_.size(); ++i) {
@@ -138,7 +192,22 @@ std::string FunctionCallExpression::to_string() const {
     result += args_[i]->to_string();
   }
   result += ")";
+  if (window_spec_) {
+    result += " OVER " + window_spec_->to_string();
+  }
   return result;
+}
+
+CastExpression::CastExpression(ExpressionPtr expr, DataType target_type)
+    : expr_(std::move(expr)), target_type_(target_type) {}
+
+const ExpressionPtr &CastExpression::get_expression() const { return expr_; }
+
+DataType CastExpression::get_target_type() const { return target_type_; }
+
+std::string CastExpression::to_string() const {
+  return "CAST(" + expr_->to_string() + " AS " +
+         data_type_to_string(target_type_) + ")";
 }
 
 void CaseExpression::add_when_then(ExpressionPtr when, ExpressionPtr then) {
@@ -327,6 +396,94 @@ std::string SelectStatement::to_string() const {
   return oss.str();
 }
 
+// ==================== SetOperationStatement ====================
+
+namespace {
+
+std::string set_operation_kind_to_string(SetOperationKind kind, bool isAll) {
+  switch (kind) {
+    case SetOperationKind::Union:
+      return isAll ? "UNION ALL" : "UNION";
+    case SetOperationKind::Intersect:
+      return "INTERSECT";
+    case SetOperationKind::Except:
+      return "EXCEPT";
+  }
+  return "UNION";
+}
+
+std::string query_operand_to_string(
+    const SetOperationStatement::Operand &operand) {
+  if (auto select = std::get_if<std::shared_ptr<SelectStatement>>(&operand)) {
+    return (*select)->to_string();
+  }
+  return std::get<std::shared_ptr<SetOperationStatement>>(operand)->to_string();
+}
+
+}  // namespace
+
+SetOperationStatement::SetOperationStatement(Operand left,
+                                             SetOperationKind kind,
+                                             Operand right, bool isAll)
+    : left_(std::move(left)),
+      right_(std::move(right)),
+      kind_(kind),
+      is_all_(isAll),
+      limit_(-1),
+      offset_(0) {}
+
+const SetOperationStatement::Operand &SetOperationStatement::get_left() const {
+  return left_;
+}
+
+const SetOperationStatement::Operand &SetOperationStatement::get_right() const {
+  return right_;
+}
+
+SetOperationKind SetOperationStatement::get_kind() const { return kind_; }
+
+bool SetOperationStatement::is_all() const { return is_all_; }
+
+void SetOperationStatement::add_order_by_column(ExpressionPtr expr,
+                                                bool ascending) {
+  order_by_columns_.emplace_back(expr, ascending);
+}
+
+void SetOperationStatement::set_limit(int limit) { limit_ = limit; }
+
+void SetOperationStatement::set_offset(int offset) { offset_ = offset; }
+
+const std::vector<std::pair<ExpressionPtr, bool>> &
+SetOperationStatement::get_order_by_columns() const {
+  return order_by_columns_;
+}
+
+int SetOperationStatement::get_limit() const { return limit_; }
+
+int SetOperationStatement::get_offset() const { return offset_; }
+
+std::string SetOperationStatement::to_string() const {
+  std::ostringstream oss;
+  oss << query_operand_to_string(left_) << " "
+      << set_operation_kind_to_string(kind_, is_all_) << " "
+      << query_operand_to_string(right_);
+  if (!order_by_columns_.empty()) {
+    oss << " ORDER BY ";
+    for (size_t i = 0; i < order_by_columns_.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << order_by_columns_[i].first->to_string();
+      oss << (order_by_columns_[i].second ? " ASC" : " DESC");
+    }
+  }
+  if (limit_ > 0) {
+    oss << " LIMIT " << limit_;
+  }
+  if (offset_ > 0) {
+    oss << " OFFSET " << offset_;
+  }
+  return oss.str();
+}
+
 // ==================== InsertStatement ====================
 
 InsertStatement::InsertStatement(const std::string &table) : table_(table) {}
@@ -337,7 +494,7 @@ void InsertStatement::add_column(const std::string &col) {
   columns_.push_back(col);
 }
 
-void InsertStatement::add_values(const std::vector<Value> &vals) {
+void InsertStatement::add_values(const std::vector<ExpressionPtr> &vals) {
   values_.push_back(vals);
 }
 
@@ -345,7 +502,8 @@ const std::vector<std::string> &InsertStatement::get_columns() const {
   return columns_;
 }
 
-const std::vector<std::vector<Value>> &InsertStatement::get_values() const {
+const std::vector<std::vector<ExpressionPtr>> &InsertStatement::get_values()
+    const {
   return values_;
 }
 
@@ -362,7 +520,7 @@ std::string InsertStatement::to_string() const {
     oss << "(";
     for (size_t j = 0; j < values_[i].size(); ++j) {
       if (j > 0) oss << ", ";
-      oss << values_[i][j].to_string();
+      oss << values_[i][j]->to_string();
     }
     oss << ")";
   }
@@ -551,9 +709,48 @@ CreateTableStatement::get_checks() const {
   return checks_;
 }
 
+void CreateTableStatement::setPartitionBy(PartitionKind kind,
+                                          std::string keyColumn) {
+  has_partition_by_ = true;
+  partition_kind_ = kind;
+  partition_key_column_ = std::move(keyColumn);
+}
+
+bool CreateTableStatement::hasPartitionBy() const { return has_partition_by_; }
+
+PartitionKind CreateTableStatement::getPartitionKind() const {
+  return partition_kind_;
+}
+
+const std::string &CreateTableStatement::getPartitionKeyColumn() const {
+  return partition_key_column_;
+}
+
+void CreateTableStatement::setPartitionOf(std::string parentName,
+                                          PartitionBound bound) {
+  is_partition_of_ = true;
+  partition_of_parent_ = std::move(parentName);
+  partition_bound_ = std::move(bound);
+}
+
+bool CreateTableStatement::isPartitionOf() const { return is_partition_of_; }
+
+const std::string &CreateTableStatement::getPartitionOfParent() const {
+  return partition_of_parent_;
+}
+
+const PartitionBound &CreateTableStatement::getPartitionBound() const {
+  return partition_bound_;
+}
+
 std::string CreateTableStatement::to_string() const {
   std::ostringstream oss;
-  oss << "CREATE TABLE " << table_name_ << " (";
+  oss << "CREATE TABLE " << table_name_;
+  if (is_partition_of_) {
+    oss << " PARTITION OF " << partition_of_parent_;
+    return oss.str();
+  }
+  oss << " (";
   for (size_t i = 0; i < columns_.size(); ++i) {
     if (i > 0) oss << ", ";
     oss << columns_[i].to_string();
@@ -564,21 +761,19 @@ std::string CreateTableStatement::to_string() const {
       if (i > 0) oss << ", ";
       oss << fk.child_columns[i];
     }
-    oss << ") REFERENCES " << fk.parent_table << "(";
+    oss << ") REFERENCES " << fk.parent_table << " (";
     for (size_t i = 0; i < fk.parent_columns.size(); ++i) {
       if (i > 0) oss << ", ";
       oss << fk.parent_columns[i];
     }
     oss << ")";
   }
-  for (const auto &check : checks_) {
-    oss << ", ";
-    if (!check.name.empty()) {
-      oss << "CONSTRAINT " << check.name << " ";
-    }
-    oss << "CHECK (" << check.expression_text << ")";
-  }
   oss << ")";
+  if (has_partition_by_) {
+    oss << " PARTITION BY "
+        << (partition_kind_ == PartitionKind::Range ? "RANGE" : "HASH") << " ("
+        << partition_key_column_ << ")";
+  }
   return oss.str();
 }
 
@@ -693,6 +888,175 @@ std::string DropViewStatement::to_string() const {
     return "DROP VIEW IF EXISTS " + view_name_;
   }
   return "DROP VIEW " + view_name_;
+}
+
+CreateFunctionStatement::CreateFunctionStatement(
+    std::string name, std::vector<RoutineParamAst> params,
+    std::string return_type, ExpressionPtr body, std::string source_sql)
+    : name_(std::move(name)),
+      params_(std::move(params)),
+      return_type_(std::move(return_type)),
+      body_(std::move(body)),
+      source_sql_(std::move(source_sql)) {}
+
+const std::string &CreateFunctionStatement::get_name() const { return name_; }
+
+const std::vector<RoutineParamAst> &CreateFunctionStatement::get_params()
+    const {
+  return params_;
+}
+
+const std::string &CreateFunctionStatement::get_return_type() const {
+  return return_type_;
+}
+
+const ExpressionPtr &CreateFunctionStatement::get_body() const { return body_; }
+
+const std::string &CreateFunctionStatement::get_source_sql() const {
+  return source_sql_;
+}
+
+std::string CreateFunctionStatement::to_string() const {
+  return source_sql_.empty() ? ("CREATE FUNCTION " + name_) : source_sql_;
+}
+
+DropFunctionStatement::DropFunctionStatement(std::string name, bool if_exists)
+    : name_(std::move(name)), if_exists_(if_exists) {}
+
+const std::string &DropFunctionStatement::get_name() const { return name_; }
+
+bool DropFunctionStatement::is_if_exists() const { return if_exists_; }
+
+std::string DropFunctionStatement::to_string() const {
+  if (if_exists_) {
+    return "DROP FUNCTION IF EXISTS " + name_;
+  }
+  return "DROP FUNCTION " + name_;
+}
+
+CreateProcedureStatement::CreateProcedureStatement(
+    std::string name, std::vector<RoutineParamAst> params,
+    std::vector<std::string> statement_sqls, std::string source_sql)
+    : name_(std::move(name)),
+      params_(std::move(params)),
+      statement_sqls_(std::move(statement_sqls)),
+      source_sql_(std::move(source_sql)) {}
+
+const std::string &CreateProcedureStatement::get_name() const { return name_; }
+
+const std::vector<RoutineParamAst> &CreateProcedureStatement::get_params()
+    const {
+  return params_;
+}
+
+const std::vector<std::string> &CreateProcedureStatement::get_statement_sqls()
+    const {
+  return statement_sqls_;
+}
+
+const std::string &CreateProcedureStatement::get_source_sql() const {
+  return source_sql_;
+}
+
+std::string CreateProcedureStatement::to_string() const {
+  return source_sql_.empty() ? ("CREATE PROCEDURE " + name_) : source_sql_;
+}
+
+DropProcedureStatement::DropProcedureStatement(std::string name, bool if_exists)
+    : name_(std::move(name)), if_exists_(if_exists) {}
+
+const std::string &DropProcedureStatement::get_name() const { return name_; }
+
+bool DropProcedureStatement::is_if_exists() const { return if_exists_; }
+
+std::string DropProcedureStatement::to_string() const {
+  if (if_exists_) {
+    return "DROP PROCEDURE IF EXISTS " + name_;
+  }
+  return "DROP PROCEDURE " + name_;
+}
+
+CallStatement::CallStatement(std::string name,
+                             std::vector<ExpressionPtr> arguments)
+    : name_(std::move(name)), arguments_(std::move(arguments)) {}
+
+const std::string &CallStatement::get_name() const { return name_; }
+
+const std::vector<ExpressionPtr> &CallStatement::get_arguments() const {
+  return arguments_;
+}
+
+std::string CallStatement::to_string() const {
+  std::string result = "CALL " + name_ + "(";
+  for (size_t i = 0; i < arguments_.size(); ++i) {
+    if (i > 0) {
+      result += ", ";
+    }
+    result += arguments_[i]->to_string();
+  }
+  result += ")";
+  return result;
+}
+
+CreateTriggerStatement::CreateTriggerStatement(
+    std::string name, std::string table_name, TriggerTiming timing,
+    TriggerEvent event, std::vector<std::string> statement_sqls,
+    std::string source_sql)
+    : name_(std::move(name)),
+      table_name_(std::move(table_name)),
+      timing_(timing),
+      event_(event),
+      statement_sqls_(std::move(statement_sqls)),
+      source_sql_(std::move(source_sql)) {}
+
+const std::string &CreateTriggerStatement::get_name() const { return name_; }
+
+const std::string &CreateTriggerStatement::get_table_name() const {
+  return table_name_;
+}
+
+TriggerTiming CreateTriggerStatement::get_timing() const { return timing_; }
+
+TriggerEvent CreateTriggerStatement::get_event() const { return event_; }
+
+const std::vector<std::string> &CreateTriggerStatement::get_statement_sqls()
+    const {
+  return statement_sqls_;
+}
+
+const std::string &CreateTriggerStatement::get_source_sql() const {
+  return source_sql_;
+}
+
+std::string CreateTriggerStatement::to_string() const {
+  return source_sql_.empty() ? ("CREATE TRIGGER " + name_) : source_sql_;
+}
+
+DropTriggerStatement::DropTriggerStatement(std::string name, bool if_exists)
+    : name_(std::move(name)), if_exists_(if_exists) {}
+
+const std::string &DropTriggerStatement::get_name() const { return name_; }
+
+bool DropTriggerStatement::is_if_exists() const { return if_exists_; }
+
+std::string DropTriggerStatement::to_string() const {
+  if (if_exists_) {
+    return "DROP TRIGGER IF EXISTS " + name_;
+  }
+  return "DROP TRIGGER " + name_;
+}
+
+SetNewStatement::SetNewStatement(std::string column_name, ExpressionPtr value)
+    : column_name_(std::move(column_name)), value_(std::move(value)) {}
+
+const std::string &SetNewStatement::get_column_name() const {
+  return column_name_;
+}
+
+const ExpressionPtr &SetNewStatement::get_value() const { return value_; }
+
+std::string SetNewStatement::to_string() const {
+  return "SET NEW." + column_name_ + " = " + value_->to_string();
 }
 
 std::string BeginStatement::to_string() const { return "BEGIN"; }

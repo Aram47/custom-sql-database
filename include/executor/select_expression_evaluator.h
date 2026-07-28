@@ -3,6 +3,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/bind_context.h"
@@ -12,6 +13,8 @@
 #include "parser/ast.h"
 
 namespace db {
+
+class RoutineCatalog;
 
 /**
  * Shared expression semantics for SELECT / JOIN / UPDATE-style row contexts.
@@ -36,6 +39,9 @@ class SelectExpressionEvaluator {
   void set_exists_subquery_fn(ExistsSubqueryFn fn);
   void set_correlation_context(CorrelationContext *context);
   void set_bind_context(const BindContext *context);
+  void set_routine_catalog(const RoutineCatalog *catalog);
+  /** Named locals for UDF / procedure parameters (checked before columns). */
+  void set_local_variables(std::unordered_map<std::string, Value> locals);
   /** Looks up an outer correlated column value, if available. */
   std::optional<Value> lookup_correlated(
       const ColumnRefExpression &cref) const;
@@ -87,6 +93,8 @@ class SelectExpressionEvaluator {
   ExistsSubqueryFn exists_subquery_fn_;
   mutable CorrelationContext *correlation_{nullptr};
   const BindContext *bind_context_{nullptr};
+  const RoutineCatalog *routine_catalog_{nullptr};
+  std::unordered_map<std::string, Value> local_variables_;
 };
 
 }  // namespace db

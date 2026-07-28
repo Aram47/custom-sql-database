@@ -37,7 +37,11 @@ class PersistenceManager {
 
  private:
   static constexpr uint32_t kMagicNumber = 0x44425442;  // "DBTB"
-  static constexpr uint16_t kVersion = 5;
+  /**
+   * Format v6: schema header (as v5) then page_count + fixed-size heap pages.
+   * WAL still stores the full .db file as a logical table blob (no page-diff WAL).
+   */
+  static constexpr uint16_t kVersion = 6;
   static constexpr uint16_t kMinSupportedVersion = 1;
   static void write_header(std::ofstream &file, const std::string &table_name);
   /** Reads magic/version/name; returns file format version. */

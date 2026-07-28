@@ -35,7 +35,17 @@ TEST(CliOptionsTest, ParsesAllFlags) {
   EXPECT_EQ(opts->port, 9100);
   EXPECT_EQ(opts->workers, 8u);
   EXPECT_EQ(opts->data_directory, "/tmp/db");
+  EXPECT_EQ(opts->buffer_pool_pages, 64u);
   EXPECT_EQ(opts->log_level, LogLevel::Debug);
+}
+
+TEST(CliOptionsTest, ParsesBufferPoolPages) {
+  std::vector<std::string> storage{"nobugdb", "--buffer-pool-pages", "128"};
+  auto argv = make_argv(storage);
+  std::string err;
+  auto opts = parse_cli_options(static_cast<int>(argv.size()), argv.data(), err);
+  ASSERT_TRUE(opts.has_value()) << err;
+  EXPECT_EQ(opts->buffer_pool_pages, 128u);
 }
 
 TEST(CliOptionsTest, ParsesAuthFlags) {
@@ -64,6 +74,32 @@ TEST(CliOptionsTest, AuthFileDefaultsRequireAuth) {
 
 TEST(CliOptionsTest, BootstrapWithoutAuthFileFails) {
   std::vector<std::string> storage{"nobugdb", "--bootstrap-admin", "x"};
+  auto argv = make_argv(storage);
+  std::string err;
+  auto opts = parse_cli_options(static_cast<int>(argv.size()), argv.data(), err);
+  EXPECT_FALSE(opts.has_value());
+}
+
+TEST(CliOptionsTest, ParsesEqualsFormAndClusterFlags) {
+  std::vector<std::string> storage{
+      "nobugdb", "--role=coordinator", "--shard-map=/tmp/shard_map.conf",
+      "--rpc-secret=secret", "--shard-id=0"};
+  auto argv = make_argv(storage);
+  std::string err;
+  auto opts = parse_cli_options(static_cast<int>(argv.size()), argv.data(), err);
+  ASSERT_TRUE(opts.has_value()) << err;
+  EXPECT_EQ(opts->role, ServerRole::Coordinator);
+  ASSERT_TRUE(opts->shard_map_path.has_value());
+  EXPECT_EQ(*opts->shard_map_path, "/tmp/shard_map.conf");
+  ASSERT_TRUE(opts->rpc_secret.has_value());
+  EXPECT_EQ(*opts->rpc_secret, "secret");
+  ASSERT_TRUE(opts->shard_id.has_value());
+  EXPECT_EQ(*opts->shard_id, 0);
+}
+
+TEST(CliOptionsTest, CoordinatorRequiresShardMap) {
+  std::vector<std::string> storage{"nobugdb", "--role", "coordinator",
+                                   "--rpc-secret", "s"};
   auto argv = make_argv(storage);
   std::string err;
   auto opts = parse_cli_options(static_cast<int>(argv.size()), argv.data(), err);

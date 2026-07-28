@@ -5,10 +5,12 @@
 #include "core/database.h"
 #include "core/session_context.h"
 #include "executor/group_aggregate_operator.h"
+#include "executor/hash_join_executor.h"
 #include "executor/index_predicate.h"
 #include "executor/select_analysis.h"
 #include "executor/select_expression_evaluator.h"
 #include "executor/select_pipeline.h"
+#include "planner/join_method_plan.h"
 #include "planner/join_order_planner.h"
 
 namespace db {
@@ -200,18 +202,15 @@ QueryResult JoinSelectExecutor::execute() {
   if (auto grouping_err = validate_select_for_grouping(stmt_)) {
     return QueryResult::error_result(*grouping_err);
   }
+  if (auto window_err = validate_select_for_windows(stmt_)) {
+    return QueryResult::error_result(*window_err);
+  }
 
   /* --- Nested-loop join --- */
   std::vector<std::vector<Value>> current;
-  SessionContext *session =
-      database_ ? database_->get_active_session() : nullptr;
   const auto load_visible = [&](Table *tbl) {
-    if (!database_) {
-      return tbl->get_all_rows();
-    }
-    return tbl->get_visible_rows(database_->get_transaction_manager(),
-                                 database_->get_reader_xid(session),
-                                 database_->get_reader_snapshot(session));
+    return database_->loadVisibleRowsForRelation(
+        tbl, stmt_->get_where_condition());
   };
   for (const auto &r : load_visible(from_tbl)) {
     current.push_back(row_values(r));
@@ -255,6 +254,28 @@ QueryResult JoinSelectExecutor::execute() {
                                                    right_column);
       const std::string &rhs_alias = aliases[ji];
       const std::string &lhs_alias = aliases[ji - 1];
+      Table *lhs_table = ordered_tables[ji - 1];
+      std::vector<std::vector<Value>> rhs_value_rows;
+      rhs_value_rows.reserve(rhs_rows.size());
+      for (const auto &rr : rhs_rows) {
+        rhs_value_rows.push_back(row_values(rr));
+      }
+      EquiJoinPlan equi_plan;
+      if (is_equi && ordered_tables.size() == 2) {
+        std::vector<SelectColumnBinding> left_bindings(
+            full_bindings.begin(), full_bindings.begin() + lw);
+        equi_plan = planEquiJoinMethod(
+            database_, lhs_table, rhs, lhs_alias, rhs_alias, on_expr,
+            current.size(), rhs_value_rows.size(), left_bindings);
+      }
+      if (equi_plan.is_equi &&
+          equi_plan.method.kind == JoinMethodKind::HashJoin) {
+        next = HashJoinExecutor::executeInnerEqui(
+            current, rhs_value_rows,
+            static_cast<size_t>(equi_plan.left_key_index),
+            static_cast<size_t>(equi_plan.right_key_index),
+            equi_plan.method.build_on_left);
+      } else {
       int rhs_col_idx = -1;
       int lhs_col_in_combined = -1;
       bool use_rhs_index = false;
@@ -329,6 +350,7 @@ QueryResult JoinSelectExecutor::execute() {
             }
           }
         }
+      }
       }
     } else if (join_type == "LEFT") {
       std::string left_table;
@@ -501,8 +523,25 @@ QueryResult JoinSelectExecutor::execute() {
         for (size_t i = 0; i < jr.get_column_count(); ++i) {
           out_row.push_back(jr.get_value(i));
         }
+      } else if (auto fn =
+                     std::dynamic_pointer_cast<FunctionCallExpression>(expr)) {
+        if (fn->is_windowed()) {
+          out_row.push_back(Value());
+        } else {
+          std::string eval_error;
+          out_row.push_back(
+              full_eval.evaluate_expression(jr, expr, &eval_error));
+          if (!eval_error.empty()) {
+            return QueryResult::error_result(eval_error);
+          }
+        }
       } else {
-        out_row.push_back(full_eval.evaluate_expression(jr, expr, nullptr));
+        std::string eval_error;
+        out_row.push_back(
+            full_eval.evaluate_expression(jr, expr, &eval_error));
+        if (!eval_error.empty()) {
+          return QueryResult::error_result(eval_error);
+        }
       }
     }
     result.rows.push_back(std::move(out_row));

@@ -142,6 +142,28 @@ Token Lexer::scan_token() {
     case '?':
       return make_token(TokenType::PARAMETER, "?");
     case '$': {
+      if (!is_at_end() && current_char() == '$') {
+        advance();
+        std::string value;
+        const int start_col = column_ - 2;
+        const int start_line = line_;
+        while (!is_at_end()) {
+          if (current_char() == '$' && peek_char() == '$') {
+            advance();
+            advance();
+            return Token(TokenType::DOLLAR_QUOTED_STRING, value, start_line,
+                         start_col);
+          }
+          if (current_char() == '\n') {
+            line_++;
+            column_ = 0;
+          }
+          value += current_char();
+          advance();
+        }
+        throw ParseException("Unclosed dollar-quoted string starting at line " +
+                             std::to_string(start_line));
+      }
       if (!is_digit(current_char())) {
         return Token(TokenType::UNKNOWN, "$", line_, column_);
       }
@@ -372,6 +394,29 @@ TokenType Lexer::get_keyword_token_type(const std::string &keyword) const {
   if (upper == "VACUUM") return TokenType::VACUUM;
   if (upper == "EXPLAIN") return TokenType::EXPLAIN;
   if (upper == "CHECK") return TokenType::CHECK;
+  if (upper == "UNION") return TokenType::UNION;
+  if (upper == "INTERSECT") return TokenType::INTERSECT;
+  if (upper == "EXCEPT") return TokenType::EXCEPT;
+  if (upper == "ALL") return TokenType::ALL;
+  if (upper == "OVER") return TokenType::OVER;
+  if (upper == "PARTITION") return TokenType::PARTITION;
+  if (upper == "RANGE") return TokenType::RANGE;
+  if (upper == "HASH") return TokenType::HASH;
+  if (upper == "OF") return TokenType::OF;
+  if (upper == "FOR") return TokenType::FOR;
+  if (upper == "WITH") return TokenType::WITH;
+  if (upper == "MODULUS") return TokenType::MODULUS;
+  if (upper == "REMAINDER") return TokenType::REMAINDER;
+  if (upper == "FUNCTION") return TokenType::FUNCTION;
+  if (upper == "RETURNS") return TokenType::RETURNS;
+  if (upper == "RETURN") return TokenType::RETURN;
+  if (upper == "PROCEDURE") return TokenType::PROCEDURE;
+  if (upper == "CALL") return TokenType::CALL;
+  if (upper == "TRIGGER") return TokenType::TRIGGER;
+  if (upper == "BEFORE") return TokenType::BEFORE;
+  if (upper == "AFTER") return TokenType::AFTER;
+  if (upper == "EACH") return TokenType::EACH;
+  if (upper == "ROW") return TokenType::ROW;
   if (upper == "COUNT") return TokenType::COUNT;
   if (upper == "SUM") return TokenType::SUM;
   if (upper == "AVG") return TokenType::AVG;

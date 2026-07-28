@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
@@ -12,20 +13,31 @@
 #include "core/column.h"
 #include "core/foreign_key.h"
 #include "core/index_key.h"
+#include "core/partition.h"
 #include "core/row.h"
 #include "core/transaction_manager.h"
+#include "storage/buffer_pool.h"
+#include "storage/heap_file.h"
+#include "storage/item_pointer.h"
+#include "storage/page_store.h"
 #include "types/value.h"
 #include "utils/exceptions.h"
 
 namespace db {
 
-/** In-memory table with schema, rows, and B-tree indexes on PK/UNIQUE. */
+/** Table facade over a page-backed HeapFile with in-memory indexes. */
 class Table {
  public:
   explicit Table(const std::string &name);
+  /**
+   * Constructs a table using a shared buffer pool and an owned page store.
+   * Used by Database / PersistenceManager for durable heaps.
+   */
+  Table(const std::string &name, FileId file_id, IBufferPool &buffer_pool,
+        std::unique_ptr<IPageStore> page_store);
   ~Table() = default;
 
-  /** Deep-copies schema, rows, secondary indexes and foreign keys. */
+  /** Deep-copies schema, heap rows, secondary indexes and foreign keys. */
   std::unique_ptr<Table> clone() const;
 
   Table(const Table &) = delete;
@@ -130,16 +142,43 @@ class Table {
   void clear_dirty();
   bool is_dirty() const;
 
-  std::vector<Row> &get_mutable_rows();
   std::string to_string() const;
 
   IndexKey build_index_key(const Row &row,
                            const std::vector<std::string> &column_names) const;
 
+  HeapFile &get_heap();
+  const HeapFile &get_heap() const;
+  FileId get_file_id() const;
+
+  /** Rebuilds logical row ids by scanning all live heap slots. */
+  void rebuild_row_directory();
+
+  /** Replaces heap page images (used by PersistenceManager load). */
+  void replace_heap_pages(const std::vector<std::vector<uint8_t>> &pages);
+
+  /** Flushes this table's dirty pages through the buffer pool. */
+  void flush_heap();
+
+  /** Allocates a process-wide unique file id for heap registration. */
+  static FileId allocate_file_id();
+
+  /** True when this table is a partitioned parent (catalog-only rows). */
+  bool isPartitioned() const;
+  const PartitionedTableMetadata *getPartitionMetadata() const;
+  PartitionedTableMetadata *getMutablePartitionMetadata();
+  void setPartitionMetadata(std::unique_ptr<PartitionedTableMetadata> metadata);
+  void clearPartitionMetadata();
+
  private:
   std::string table_name_;
   std::vector<Column> columns_;
-  std::vector<Row> rows_;
+  std::unique_ptr<IPageStore> owned_store_;
+  std::unique_ptr<BufferPool> owned_pool_;
+  IBufferPool *buffer_pool_{nullptr};
+  FileId file_id_{0};
+  std::unique_ptr<HeapFile> heap_;
+  std::vector<ItemPointer> row_directory_;
   std::map<std::string, std::unique_ptr<BTreeIndex>> column_indices_;
   /** Named secondary indexes (single- and multi-column). */
   std::map<std::string, std::unique_ptr<BTreeIndex>> named_indices_;
@@ -147,8 +186,12 @@ class Table {
   std::map<std::string, std::vector<std::string>> secondary_indexes_;
   std::vector<ForeignKeyDefinition> foreign_keys_;
   std::vector<CheckConstraintDefinition> checks_;
+  std::unique_ptr<PartitionedTableMetadata> partition_meta_;
   bool dirty_{false};
 
+  void initialize_heap();
+  void sync_heap_column_types();
+  std::vector<DataType> collect_column_types() const;
   void build_index(const std::string &column_name);
   void build_named_index(const std::string &index_name);
   void insert_into_indexes(const Row &row, size_t row_index);
@@ -157,6 +200,7 @@ class Table {
   void validate_schema(const Row &row) const;
   int get_primary_key_index() const;
   void reindex_after_delete();
+  void replace_row(size_t index, const Row &row);
 };
 
 }  // namespace db

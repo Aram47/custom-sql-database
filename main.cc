@@ -29,7 +29,8 @@ int main(int argc, char *argv[]) {
     DB_LOG_INFO("0 bugs found.");
     DB_LOG_INFO("Welcome.");
     DB_LOG_INFO("Starting server on port ", options->port, " (workers=",
-                options->workers, ", data-dir=", options->data_directory, ")");
+                options->workers, ", data-dir=", options->data_directory,
+                ", buffer-pool-pages=", options->buffer_pool_pages, ")");
     ServerAuthConfig auth_config;
     auth_config.auth_file = options->auth_file;
     auth_config.require_auth = options->effective_require_auth();
@@ -37,8 +38,13 @@ int main(int argc, char *argv[]) {
     if (auth_config.require_auth) {
       DB_LOG_INFO("Authentication required");
     }
+    ServerClusterConfig cluster_config;
+    cluster_config.role = options->role;
+    cluster_config.shard_id = options->shard_id;
+    cluster_config.shard_map_path = options->shard_map_path;
+    cluster_config.rpc_secret = options->rpc_secret;
     Server server(options->port, options->workers, options->data_directory,
-                  auth_config);
+                  auth_config, options->buffer_pool_pages, cluster_config);
     server.start();
     server.wait();
     DB_LOG_INFO("Server shutdown complete");
