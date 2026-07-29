@@ -64,6 +64,20 @@ TEST(SelectRelationalOpsTest, LimitAndOffset) {
   EXPECT_EQ(offset.rows[0][0].as_int(), 2);
 }
 
+TEST(SelectRelationalOpsTest, LimitZeroReturnsEmpty) {
+  test_util::TempDbDir tmp;
+  Database db(tmp.path_string());
+  setup_sales_db(&db);
+
+  auto zero = db.execute_query("SELECT id FROM sales ORDER BY id LIMIT 0");
+  ASSERT_TRUE(zero.success) << zero.message;
+  EXPECT_EQ(zero.rows.size(), 0u);
+
+  auto unlimited = db.execute_query("SELECT id FROM sales ORDER BY id");
+  ASSERT_TRUE(unlimited.success) << unlimited.message;
+  EXPECT_EQ(unlimited.rows.size(), 3u);
+}
+
 TEST(SelectRelationalOpsTest, GroupByCountStar) {
   test_util::TempDbDir tmp;
   Database db(tmp.path_string());

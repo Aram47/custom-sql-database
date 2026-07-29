@@ -103,5 +103,48 @@ TEST(LexerTest, ExplainKeyword) {
   EXPECT_EQ(tokens[2].get_type(), TokenType::END_OF_INPUT);
 }
 
+TEST(LexerTest, DoubledSingleQuoteEscape) {
+  Lexer lexer("'O''Brien'");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_EQ(tokens.size(), 2u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::STRING);
+  EXPECT_EQ(tokens[0].get_lexeme(), "O'Brien");
+  EXPECT_EQ(tokens[1].get_type(), TokenType::END_OF_INPUT);
+}
+
+TEST(LexerTest, DoubledQuoteInjectionPayload) {
+  Lexer lexer("'x''; DROP TABLE secrets; --'");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_EQ(tokens.size(), 2u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::STRING);
+  EXPECT_EQ(tokens[0].get_lexeme(), "x'; DROP TABLE secrets; --");
+  EXPECT_EQ(tokens[1].get_type(), TokenType::END_OF_INPUT);
+}
+
+TEST(LexerTest, EmptyStringLiteral) {
+  Lexer lexer("''");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_EQ(tokens.size(), 2u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::STRING);
+  EXPECT_EQ(tokens[0].get_lexeme(), "");
+  EXPECT_EQ(tokens[1].get_type(), TokenType::END_OF_INPUT);
+}
+
+TEST(LexerTest, TrailingDoubledQuote) {
+  Lexer lexer("'ends with '''");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_EQ(tokens.size(), 2u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::STRING);
+  EXPECT_EQ(tokens[0].get_lexeme(), "ends with '");
+}
+
+TEST(LexerTest, BackslashEscapeStillWorks) {
+  Lexer lexer("'a\\'b'");
+  auto tokens = lexer.get_all_tokens();
+  ASSERT_EQ(tokens.size(), 2u);
+  EXPECT_EQ(tokens[0].get_type(), TokenType::STRING);
+  EXPECT_EQ(tokens[0].get_lexeme(), "a'b");
+}
+
 }  // namespace
 }  // namespace db

@@ -385,7 +385,7 @@ std::string SelectStatement::to_string() const {
     }
   }
 
-  if (limit_ > 0) {
+  if (limit_ >= 0) {
     oss << " LIMIT " << limit_;
   }
 
@@ -475,7 +475,7 @@ std::string SetOperationStatement::to_string() const {
       oss << (order_by_columns_[i].second ? " ASC" : " DESC");
     }
   }
-  if (limit_ > 0) {
+  if (limit_ >= 0) {
     oss << " LIMIT " << limit_;
   }
   if (offset_ > 0) {

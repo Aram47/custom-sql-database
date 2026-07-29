@@ -48,6 +48,8 @@ enum class TokenType {
   VALUES,
   SET,
   NULL_KW,
+  TRUE_KW,
+  FALSE_KW,
   AS,
   DISTINCT,
   INDEX,

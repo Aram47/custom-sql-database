@@ -185,7 +185,19 @@ Token Lexer::scan_string(char quote) {
   int start_line = line_;
   int start_col = column_;
 
-  while (!is_at_end() && current_char() != quote) {
+  while (!is_at_end()) {
+    if (current_char() == quote) {
+      // SQL-standard doubled quote ('') -> one quote character in the value.
+      if (peek_char() == quote) {
+        value += quote;
+        advance();
+        advance();
+        continue;
+      }
+      advance();  // Consume closing quote
+      break;
+    }
+
     if (current_char() == '\\') {
       advance();
       if (!is_at_end()) {
@@ -221,10 +233,6 @@ Token Lexer::scan_string(char quote) {
       value += current_char();
       advance();
     }
-  }
-
-  if (!is_at_end() && current_char() == quote) {
-    advance();  // Consume closing quote
   }
 
   return Token(TokenType::STRING, value, start_line, start_col);
@@ -375,6 +383,8 @@ TokenType Lexer::get_keyword_token_type(const std::string &keyword) const {
   if (upper == "VALUES") return TokenType::VALUES;
   if (upper == "SET") return TokenType::SET;
   if (upper == "NULL") return TokenType::NULL_KW;
+  if (upper == "TRUE") return TokenType::TRUE_KW;
+  if (upper == "FALSE") return TokenType::FALSE_KW;
   if (upper == "AS") return TokenType::AS;
   if (upper == "DISTINCT") return TokenType::DISTINCT;
   if (upper == "INDEX") return TokenType::INDEX;

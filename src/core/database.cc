@@ -822,7 +822,8 @@ QueryResult Database::execute_set_operation_statement(
   if (!combined.success) {
     return combined;
   }
-  if (stmt->get_order_by_columns().empty() && stmt->get_limit() <= 0 &&
+  // limit < 0 means unlimited; limit == 0 must still apply (empty result).
+  if (stmt->get_order_by_columns().empty() && stmt->get_limit() < 0 &&
       stmt->get_offset() <= 0) {
     return combined;
   }

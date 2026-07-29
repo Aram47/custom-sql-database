@@ -10,7 +10,9 @@ QueryResult LimitOffsetOperator::apply(
   const int offset = ctx.statement->get_offset();
   const int limit = ctx.statement->get_limit();
 
-  if (offset <= 0 && limit <= 0) return input;
+  // Semantics: limit < 0 (typically -1) = unlimited; limit == 0 = empty;
+  // limit > 0 = truncate to N rows after OFFSET.
+  if (offset <= 0 && limit < 0) return input;
 
   if (offset > 0) {
     const size_t off = static_cast<size_t>(offset);
@@ -22,7 +24,9 @@ QueryResult LimitOffsetOperator::apply(
     }
   }
 
-  if (limit > 0 && static_cast<size_t>(limit) < input.rows.size()) {
+  if (limit == 0) {
+    input.rows.clear();
+  } else if (limit > 0 && static_cast<size_t>(limit) < input.rows.size()) {
     input.rows.resize(static_cast<size_t>(limit));
   }
 

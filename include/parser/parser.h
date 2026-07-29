@@ -142,6 +142,8 @@ class Parser {
   SetOperationStatement::Operand parse_query_primary();
   SetOperationStatement::Operand parse_query_inner();
   bool match_set_operation(SetOperationKind &kind, bool &isAll);
+  /** Optional `AS alias` or bare `alias` after a table name. */
+  std::string parse_optional_table_alias(const std::string &default_alias);
 };
 
 }  // namespace db

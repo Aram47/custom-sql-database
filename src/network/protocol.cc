@@ -8,6 +8,9 @@
 namespace db {
 namespace {
 
+// Textual wire NULL marker (PostgreSQL COPY-compatible). Empty STRING stays "".
+constexpr const char *kWireNull = "\\N";
+
 std::vector<std::string> split_tabs(const std::string &line) {
   std::vector<std::string> parts;
   std::string current;
@@ -21,6 +24,20 @@ std::vector<std::string> split_tabs(const std::string &line) {
   }
   parts.push_back(current);
   return parts;
+}
+
+std::string encode_wire_cell(const Value &val) {
+  if (val.is_null()) {
+    return kWireNull;
+  }
+  return val.to_string();
+}
+
+Value decode_wire_cell(const std::string &cell) {
+  if (cell == kWireNull) {
+    return Value();
+  }
+  return Value(cell);
 }
 
 }  // namespace
@@ -77,8 +94,10 @@ std::string Protocol::format_query_result(const QueryResult &result) {
   resp.column_names = result.column_names;
   for (const auto &row : result.rows) {
     std::vector<std::string> strRow;
+    strRow.reserve(row.size());
     for (const auto &val : row) {
-      strRow.push_back(val.to_string());
+      // NULL -> "\N"; empty STRING -> "" (distinct wire values).
+      strRow.push_back(encode_wire_cell(val));
     }
     resp.rows.push_back(strRow);
   }
@@ -116,7 +135,12 @@ QueryResult Protocol::parse_query_result(const std::string &message) {
     return QueryResult::error_result("invalid RPC response");
   }
   std::string body = message.substr(3);
-  while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) {
+  // Strip at most one trailing response newline so an empty-string data row
+  // (e.g. "OK|s\n\n") is preserved.
+  if (!body.empty() && (body.back() == '\n' || body.back() == '\r')) {
+    body.pop_back();
+  }
+  if (!body.empty() && body.back() == '\r') {
     body.pop_back();
   }
   QueryResult result = QueryResult::success_result("OK");
@@ -146,14 +170,16 @@ QueryResult Protocol::parse_query_result(const std::string &message) {
     result.column_names.clear();
   }
   for (size_t i = 1; i < lines.size(); ++i) {
-    if (lines[i].empty()) {
+    // Preserve empty data lines as empty-string rows; only skip when there
+    // are no columns (status-like body) — otherwise empty cell rows matter.
+    if (lines[i].empty() && result.column_names.empty()) {
       continue;
     }
     const std::vector<std::string> cells = split_tabs(lines[i]);
     std::vector<Value> row;
     row.reserve(cells.size());
     for (const std::string &cell : cells) {
-      row.emplace_back(cell);
+      row.push_back(decode_wire_cell(cell));
     }
     result.rows.push_back(std::move(row));
   }

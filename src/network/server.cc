@@ -4,6 +4,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <vector>
 
 #include "core/shard_map.h"
 #include "core/shard_router.h"
@@ -175,14 +176,16 @@ void Connection::run() {
 }
 
 std::string Connection::read_message() {
-  char buffer[4096];
-  std::memset(buffer, 0, sizeof(buffer));
-  ssize_t bytes_read = client_socket_.recv(buffer, sizeof(buffer) - 1);
+  // Keep in sync with NoBugDB-ORM DEFAULT_MAX_REQUEST_BYTES (1 MiB).
+  constexpr size_t kMaxRequestBytes = 1 << 20;
+  std::vector<char> buffer(kMaxRequestBytes);
+  std::memset(buffer.data(), 0, buffer.size());
+  ssize_t bytes_read = client_socket_.recv(buffer.data(), buffer.size() - 1);
   if (bytes_read <= 0) {
     return "";
   }
-  buffer[bytes_read] = '\0';
-  return std::string(buffer);
+  buffer[static_cast<size_t>(bytes_read)] = '\0';
+  return std::string(buffer.data(), static_cast<size_t>(bytes_read));
 }
 
 void Connection::send_message(const std::string &message) {

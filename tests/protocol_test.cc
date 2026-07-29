@@ -63,6 +63,26 @@ TEST(ProtocolTest, FormatQueryResultSuccess) {
   EXPECT_NE(s.find("hi"), std::string::npos);
 }
 
+TEST(ProtocolTest, FormatQueryResultNullAndEmptyStringDistinct) {
+  QueryResult qr;
+  qr.success = true;
+  qr.column_names = {"a", "b", "c"};
+  qr.rows.push_back(
+      {Value(), Value(std::string("")), Value(std::string("NULL"))});
+  std::string s = Protocol::format_query_result(qr);
+  EXPECT_EQ(s, "OK|a\tb\tc\n\\N\t\tNULL\n");
+}
+
+TEST(ProtocolTest, ParseQueryResultNullMarker) {
+  QueryResult r = Protocol::parse_query_result("OK|n\ts\n\\N\t\n");
+  ASSERT_TRUE(r.success);
+  ASSERT_EQ(r.rows.size(), 1u);
+  ASSERT_EQ(r.rows[0].size(), 2u);
+  EXPECT_TRUE(r.rows[0][0].is_null());
+  EXPECT_TRUE(r.rows[0][1].is_string());
+  EXPECT_EQ(r.rows[0][1].as_string(), "");
+}
+
 TEST(ProtocolTest, FormatQueryResultFailureUsesErrorBranch) {
   QueryResult qr = QueryResult::error_result("boom");
   std::string s = Protocol::format_query_result(qr);

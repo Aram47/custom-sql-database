@@ -101,6 +101,10 @@ std::string Token::token_type_to_string(TokenType type) {
       return "SET";
     case TokenType::NULL_KW:
       return "NULL";
+    case TokenType::TRUE_KW:
+      return "TRUE";
+    case TokenType::FALSE_KW:
+      return "FALSE";
     case TokenType::AS:
       return "AS";
     case TokenType::DISTINCT:

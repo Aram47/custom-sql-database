@@ -301,10 +301,7 @@ std::shared_ptr<SelectStatement> Parser::parse_select_core() {
   if (match(TokenType::FROM)) {
     std::string table =
         consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
-    std::string alias = table;
-    if (match(TokenType::AS)) {
-      alias = consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
-    }
+    std::string alias = parse_optional_table_alias(table);
     stmt->set_from_table(table, alias);
     while (check(TokenType::INNER) || check(TokenType::LEFT) ||
            check(TokenType::RIGHT) || check(TokenType::JOIN) ||
@@ -334,11 +331,7 @@ std::shared_ptr<SelectStatement> Parser::parse_select_core() {
       }
       std::string joinTable =
           consume(TokenType::IDENTIFIER, "Expected table name").get_lexeme();
-      std::string joinAlias = joinTable;
-      if (match(TokenType::AS)) {
-        joinAlias =
-            consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
-      }
+      std::string joinAlias = parse_optional_table_alias(joinTable);
       if (joinType == "CROSS") {
         if (match(TokenType::ON)) {
           throw ParseException(
@@ -1305,6 +1298,10 @@ std::shared_ptr<ExecutePreparedStatement> Parser::parse_execute_statement() {
       do {
         if (match(TokenType::NULL_KW)) {
           arguments.emplace_back();
+        } else if (match(TokenType::TRUE_KW)) {
+          arguments.emplace_back(true);
+        } else if (match(TokenType::FALSE_KW)) {
+          arguments.emplace_back(false);
         } else if (check(TokenType::NUMBER)) {
           std::string numStr = advance().get_lexeme();
           if (numStr.find('.') != std::string::npos) {
@@ -1668,6 +1665,12 @@ ExpressionPtr Parser::parse_primary_expression() {
   if (match(TokenType::NULL_KW)) {
     return std::make_shared<LiteralExpression>(Value());
   }
+  if (match(TokenType::TRUE_KW)) {
+    return std::make_shared<LiteralExpression>(Value(true));
+  }
+  if (match(TokenType::FALSE_KW)) {
+    return std::make_shared<LiteralExpression>(Value(false));
+  }
   if (check(TokenType::PARAMETER)) {
     return parse_parameter_expression();
   }
@@ -1788,6 +1791,27 @@ std::shared_ptr<WindowSpec> Parser::parse_window_spec() {
   } while (match(TokenType::COMMA));
   consume(TokenType::RPAREN, "Expected ) after window specification");
   return spec;
+}
+
+std::string Parser::parse_optional_table_alias(
+    const std::string &default_alias) {
+  if (match(TokenType::AS)) {
+    return consume(TokenType::IDENTIFIER, "Expected alias").get_lexeme();
+  }
+  // Bare alias: FROM t t0 — keywords (WHERE/JOIN/...) are not IDENTIFIER tokens.
+  // LIMIT/OFFSET are lexed as IDENTIFIER and must stay clause starters.
+  if (!check(TokenType::IDENTIFIER)) {
+    return default_alias;
+  }
+  const std::string &lexeme = peek().get_lexeme();
+  std::string upper = lexeme;
+  for (char &c : upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (upper == "LIMIT" || upper == "OFFSET") {
+    return default_alias;
+  }
+  return advance().get_lexeme();
 }
 
 std::string Parser::get_error_message(const std::string &message) const {

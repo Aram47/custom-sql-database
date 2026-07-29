@@ -329,7 +329,7 @@ Unauthenticated connections (when auth is required) may only send **AUTH**, **PI
 - Success: prefix **`OK|`**, then newline; first line is column names separated by **tab** `\t`; following lines are result rows, fields separated by `\t`. Implementation: [`Protocol::format_response`](src/network/protocol.cc). Auth success is `OK|authenticated\n`.
 - Error: **`ERROR|<text>\n`** (e.g. `authentication required`, `permission denied`).
 
-Limitation: a single read is capped at **4096** bytes on the server ([`Connection::read_message`](src/network/server.cc)) and **8192** bytes on the client when receiving—large queries or wide results need protocol changes (framing / length prefix).
+Limitation: a single read is capped at **1 MiB** (`1 << 20`) bytes on the server ([`Connection::read_message`](src/network/server.cc)) and **8192** bytes on the client when receiving—payloads beyond that need protocol changes (framing / length prefix).
 
 ### QUERY execution flow
 

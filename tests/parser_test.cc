@@ -73,5 +73,23 @@ TEST(ParserTest, UnknownStatementThrows) {
   EXPECT_THROW(static_cast<void>(parser.parse_statement()), ParseException);
 }
 
+TEST(ParserTest, DollarParamCountWithTableAlias) {
+  {
+    Parser p("SELECT id FROM t WHERE id = $1");
+    p.parse_statement();
+    EXPECT_EQ(p.get_parameter_count(), 1u);
+  }
+  {
+    Parser p("SELECT t0.id AS id FROM t t0 WHERE t0.id = $1");
+    p.parse_statement();
+    EXPECT_EQ(p.get_parameter_count(), 1u) << "alias+AS should still count $1";
+  }
+  {
+    Parser p("SELECT id FROM t t0 WHERE t0.id = $1");
+    p.parse_statement();
+    EXPECT_EQ(p.get_parameter_count(), 1u);
+  }
+}
+
 }  // namespace
 }  // namespace db

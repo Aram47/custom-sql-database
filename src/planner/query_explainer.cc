@@ -235,7 +235,7 @@ std::vector<std::string> QueryExplainer::explainSelect(
   if (!stmt->get_order_by_columns().empty()) {
     lines.push_back("  Sort");
   }
-  if (stmt->get_limit() > 0 || stmt->get_offset() > 0) {
+  if (stmt->get_limit() >= 0 || stmt->get_offset() > 0) {
     lines.push_back("  LimitOffset");
   }
   return lines;
@@ -286,7 +286,7 @@ std::vector<std::string> QueryExplainer::explainSetOperation(
   if (!stmt->get_order_by_columns().empty()) {
     lines.push_back("  Sort");
   }
-  if (stmt->get_limit() > 0 || stmt->get_offset() > 0) {
+  if (stmt->get_limit() >= 0 || stmt->get_offset() > 0) {
     lines.push_back("  LimitOffset");
   }
   return lines;
