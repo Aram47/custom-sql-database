@@ -7,6 +7,7 @@
 
 #include "core/check_constraint.h"
 #include "core/foreign_key.h"
+#include "core/unique_constraint.h"
 #include "storage/page_format.h"
 #include "types/type_converter.h"
 #include "utils/logger.h"
@@ -106,6 +107,24 @@ void PersistenceManager::save_table(const Table &table,
       for (const auto &check : checks) {
         write_string(file, check.name);
         write_string(file, check.expression_text);
+      }
+      const auto &pk_columns = table.get_primary_key_columns();
+      uint32_t pk_count = static_cast<uint32_t>(pk_columns.size());
+      file.write(reinterpret_cast<const char *>(&pk_count), sizeof(pk_count));
+      for (const std::string &column_name : pk_columns) {
+        write_string(file, column_name);
+      }
+      const auto &unique_constraints = table.get_unique_constraints();
+      uint32_t uq_count = static_cast<uint32_t>(unique_constraints.size());
+      file.write(reinterpret_cast<const char *>(&uq_count), sizeof(uq_count));
+      for (const auto &uq : unique_constraints) {
+        write_string(file, uq.name);
+        uint32_t uq_col_count = static_cast<uint32_t>(uq.columns.size());
+        file.write(reinterpret_cast<const char *>(&uq_col_count),
+                   sizeof(uq_col_count));
+        for (const std::string &column_name : uq.columns) {
+          write_string(file, column_name);
+        }
       }
       const_cast<Table &>(table).flush_heap();
       const std::vector<std::vector<uint8_t>> pages =
@@ -242,6 +261,35 @@ std::unique_ptr<Table> PersistenceManager::load_table(
           checks.push_back(std::move(check));
         }
         table->set_checks(std::move(checks));
+      }
+      if (version >= 7) {
+        uint32_t pk_count = 0;
+        file.read(reinterpret_cast<char *>(&pk_count), sizeof(pk_count));
+        std::vector<std::string> pk_columns;
+        pk_columns.reserve(pk_count);
+        for (uint32_t i = 0; i < pk_count; ++i) {
+          pk_columns.push_back(read_string(file));
+        }
+        table->set_primary_key_columns(std::move(pk_columns));
+        uint32_t uq_count = 0;
+        file.read(reinterpret_cast<char *>(&uq_count), sizeof(uq_count));
+        std::vector<UniqueConstraintDefinition> unique_constraints;
+        unique_constraints.reserve(uq_count);
+        for (uint32_t i = 0; i < uq_count; ++i) {
+          UniqueConstraintDefinition uq;
+          uq.name = read_string(file);
+          uint32_t uq_col_count = 0;
+          file.read(reinterpret_cast<char *>(&uq_col_count),
+                    sizeof(uq_col_count));
+          uq.columns.reserve(uq_col_count);
+          for (uint32_t c = 0; c < uq_col_count; ++c) {
+            uq.columns.push_back(read_string(file));
+          }
+          unique_constraints.push_back(std::move(uq));
+        }
+        table->set_unique_constraints(std::move(unique_constraints));
+      } else {
+        table->sync_key_metadata_from_column_flags();
       }
     }
     if (version >= 6) {

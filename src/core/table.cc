@@ -1,5 +1,7 @@
 #include "core/table.h"
 
+#include <algorithm>
+
 #include "executor/select_column_binding.h"
 #include "executor/select_expression_evaluator.h"
 
@@ -71,6 +73,9 @@ std::unique_ptr<Table> Table::clone() const {
   copy->secondary_indexes_ = secondary_indexes_;
   copy->foreign_keys_ = foreign_keys_;
   copy->checks_ = checks_;
+  copy->primary_key_columns_ = primary_key_columns_;
+  copy->unique_constraints_ = unique_constraints_;
+  copy->constraint_indexes_ = constraint_indexes_;
   if (partition_meta_) {
     auto metaCopy = std::make_unique<PartitionedTableMetadata>(
         partition_meta_->getKind(), partition_meta_->getKeyColumn());
@@ -159,6 +164,33 @@ void Table::drop_column(const std::string &column_name) {
     secondary_indexes_.erase(index_name);
     named_indices_.erase(index_name);
   }
+  std::vector<std::string> constraint_to_drop;
+  for (const auto &[index_name, cols] : constraint_indexes_) {
+    for (const std::string &col : cols) {
+      if (col == column_name) {
+        constraint_to_drop.push_back(index_name);
+        break;
+      }
+    }
+  }
+  for (const std::string &index_name : constraint_to_drop) {
+    drop_constraint_index(index_name);
+  }
+  primary_key_columns_.erase(
+      std::remove(primary_key_columns_.begin(), primary_key_columns_.end(),
+                  column_name),
+      primary_key_columns_.end());
+  unique_constraints_.erase(
+      std::remove_if(unique_constraints_.begin(), unique_constraints_.end(),
+                     [&](const UniqueConstraintDefinition &uq) {
+                       for (const std::string &col : uq.columns) {
+                         if (col == column_name) {
+                           return true;
+                         }
+                       }
+                       return false;
+                     }),
+      unique_constraints_.end());
   std::vector<Row> existing = get_all_rows();
   columns_.erase(columns_.begin() + col_idx);
   heap_->clear();
@@ -266,6 +298,13 @@ void Table::insert_into_indexes(const Row &row, size_t row_index) {
     }
     it->second->insert(build_index_key(row, column_names), row_index);
   }
+  for (const auto &[index_name, column_names] : constraint_indexes_) {
+    auto it = named_indices_.find(index_name);
+    if (it == named_indices_.end()) {
+      continue;
+    }
+    it->second->insert(build_index_key(row, column_names), row_index);
+  }
 }
 
 void Table::remove_from_indexes(const Row &row, size_t row_index) {
@@ -276,6 +315,13 @@ void Table::remove_from_indexes(const Row &row, size_t row_index) {
     }
   }
   for (const auto &[index_name, column_names] : secondary_indexes_) {
+    auto it = named_indices_.find(index_name);
+    if (it == named_indices_.end()) {
+      continue;
+    }
+    it->second->remove(build_index_key(row, column_names), row_index);
+  }
+  for (const auto &[index_name, column_names] : constraint_indexes_) {
     auto it = named_indices_.find(index_name);
     if (it == named_indices_.end()) {
       continue;
@@ -648,39 +694,37 @@ bool Table::validate_row(const Row &row, size_t exclude_row_index) const {
 
 bool Table::validate_primary_key_uniqueness(const Row &row,
                                             size_t exclude_row_index) const {
-  const int pk_idx = get_primary_key_index();
-  if (pk_idx < 0) {
-    return true;
+  std::vector<std::string> pk_columns = primary_key_columns_;
+  if (pk_columns.empty()) {
+    const int pk_idx = get_primary_key_index();
+    if (pk_idx < 0) {
+      return true;
+    }
+    pk_columns.push_back(columns_[static_cast<size_t>(pk_idx)].get_name());
   }
-  const Value &pk_value = row.get_value(static_cast<size_t>(pk_idx));
-  if (pk_value.is_null()) {
+  const IndexKey key = build_index_key(row, pk_columns);
+  if (key.has_null()) {
     return false;
   }
-  if (has_index(columns_[static_cast<size_t>(pk_idx)].get_name())) {
-    auto matches = find_rows_by_value(
-        columns_[static_cast<size_t>(pk_idx)].get_name(), pk_value);
-    for (size_t idx : matches) {
-      if (idx != exclude_row_index && get_row(idx).get_xmax() == 0) {
-        return false;
-      }
-    }
-    return true;
-  }
-  for (size_t i = 0; i < row_directory_.size(); ++i) {
-    if (i == exclude_row_index || get_row(i).get_xmax() != 0) {
-      continue;
-    }
-    if (get_row(i).get_value(static_cast<size_t>(pk_idx)) == pk_value) {
-      return false;
-    }
-  }
-  return true;
+  const std::string index_name = primary_key_index_name();
+  return !rows_share_key(key, exclude_row_index, index_name, pk_columns);
 }
 
 bool Table::validate_unique_constraint(const Row &row,
                                        size_t exclude_row_index) const {
   for (size_t i = 0; i < columns_.size(); ++i) {
     if (!columns_[i].is_unique()) {
+      continue;
+    }
+    // Skip columns covered by a table-level UNIQUE with the same single column.
+    bool covered = false;
+    for (const auto &uq : unique_constraints_) {
+      if (uq.columns.size() == 1 && uq.columns[0] == columns_[i].get_name()) {
+        covered = true;
+        break;
+      }
+    }
+    if (covered) {
       continue;
     }
     const Value &value = row.get_value(i);
@@ -705,12 +749,55 @@ bool Table::validate_unique_constraint(const Row &row,
       }
     }
   }
+  for (const auto &uq : unique_constraints_) {
+    const IndexKey key = build_index_key(row, uq.columns);
+    if (key.has_null()) {
+      continue;
+    }
+    const std::string index_name = unique_constraint_index_name(uq);
+    if (rows_share_key(key, exclude_row_index, index_name, uq.columns)) {
+      return false;
+    }
+  }
   return true;
+}
+
+bool Table::rows_share_key(const IndexKey &key, size_t exclude_row_index,
+                           const std::string &index_name,
+                           const std::vector<std::string> &column_names) const {
+  auto named_it = named_indices_.find(index_name);
+  if (named_it != named_indices_.end()) {
+    for (size_t idx : named_it->second->find_equal(key)) {
+      if (idx != exclude_row_index && get_row(idx).get_xmax() == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (column_names.size() == 1 && has_index(column_names[0])) {
+    for (size_t idx : find_rows_by_value(column_names[0],
+                                         key.get_components()[0])) {
+      if (idx != exclude_row_index && get_row(idx).get_xmax() == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    if (i == exclude_row_index || get_row(i).get_xmax() != 0) {
+      continue;
+    }
+    if (build_index_key(get_row(i), column_names) == key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void Table::rebuild_indexes() {
   column_indices_.clear();
   named_indices_.clear();
+  sync_key_metadata_from_column_flags();
   for (const auto &col : columns_) {
     if (col.is_primary_key() || col.is_unique()) {
       build_index(col.get_name());
@@ -719,6 +806,20 @@ void Table::rebuild_indexes() {
   for (const auto &[index_name, columns] : secondary_indexes_) {
     (void)columns;
     build_named_index(index_name);
+  }
+  for (const auto &[index_name, columns] : constraint_indexes_) {
+    (void)columns;
+    build_constraint_index(index_name);
+  }
+  if (!primary_key_columns_.empty() &&
+      constraint_indexes_.count(primary_key_index_name()) == 0) {
+    ensure_constraint_index(primary_key_index_name(), primary_key_columns_);
+  }
+  for (const auto &uq : unique_constraints_) {
+    const std::string name = unique_constraint_index_name(uq);
+    if (constraint_indexes_.count(name) == 0) {
+      ensure_constraint_index(name, uq.columns);
+    }
   }
 }
 
@@ -834,6 +935,198 @@ void Table::set_checks(std::vector<CheckConstraintDefinition> checks) {
   checks_ = std::move(checks);
 }
 
+const std::vector<std::string> &Table::get_primary_key_columns() const {
+  return primary_key_columns_;
+}
+
+void Table::set_primary_key_columns(std::vector<std::string> columns) {
+  primary_key_columns_ = std::move(columns);
+}
+
+void Table::sync_key_metadata_from_column_flags() {
+  if (primary_key_columns_.empty()) {
+    for (const auto &col : columns_) {
+      if (col.is_primary_key()) {
+        primary_key_columns_.push_back(col.get_name());
+      }
+    }
+  }
+}
+
+void Table::apply_primary_key(const std::vector<std::string> &columns) {
+  if (columns.empty()) {
+    throw InvalidOperationException("PRIMARY KEY must include at least one column");
+  }
+  sync_key_metadata_from_column_flags();
+  if (!primary_key_columns_.empty()) {
+    throw ConstraintException("Table already has a primary key");
+  }
+  for (const std::string &column_name : columns) {
+    if (get_column_index(column_name) < 0) {
+      throw NotFoundException("Column '" + column_name + "' not found");
+    }
+  }
+  for (const std::string &column_name : columns) {
+    const int col_idx = get_column_index(column_name);
+    Column &col = get_mutable_column(static_cast<size_t>(col_idx));
+    col.set_primary_key(true);
+  }
+  primary_key_columns_ = columns;
+  ensure_constraint_index(primary_key_index_name(), columns);
+  if (columns.size() == 1) {
+    ensure_index_for_column(columns[0]);
+  }
+  mark_dirty();
+}
+
+bool Table::drop_primary_key() {
+  sync_key_metadata_from_column_flags();
+  if (primary_key_columns_.empty()) {
+    return false;
+  }
+  drop_constraint_index(primary_key_index_name());
+  for (const std::string &column_name : primary_key_columns_) {
+    const int col_idx = get_column_index(column_name);
+    if (col_idx < 0) {
+      continue;
+    }
+    Column &col = get_mutable_column(static_cast<size_t>(col_idx));
+    col.set_primary_key(false);
+    if (!col.is_unique()) {
+      drop_index(column_name);
+    }
+  }
+  primary_key_columns_.clear();
+  mark_dirty();
+  return true;
+}
+
+const std::vector<UniqueConstraintDefinition> &Table::get_unique_constraints()
+    const {
+  return unique_constraints_;
+}
+
+void Table::set_unique_constraints(
+    std::vector<UniqueConstraintDefinition> constraints) {
+  unique_constraints_ = std::move(constraints);
+}
+
+void Table::apply_unique_constraint(
+    const UniqueConstraintDefinition &constraint) {
+  if (constraint.columns.empty()) {
+    throw InvalidOperationException("UNIQUE must include at least one column");
+  }
+  for (const std::string &column_name : constraint.columns) {
+    if (get_column_index(column_name) < 0) {
+      throw NotFoundException("Column '" + column_name + "' not found");
+    }
+  }
+  for (const auto &existing : unique_constraints_) {
+    if (existing.columns == constraint.columns) {
+      throw ConstraintException("UNIQUE constraint already exists on columns");
+    }
+    if (!constraint.name.empty() && existing.name == constraint.name) {
+      throw ConstraintException("UNIQUE constraint '" + constraint.name +
+                                "' already exists");
+    }
+  }
+  UniqueConstraintDefinition stored = constraint;
+  if (stored.name.empty()) {
+    stored.name = "uq";
+    for (const std::string &col : stored.columns) {
+      stored.name += "_" + col;
+    }
+  }
+  unique_constraints_.push_back(stored);
+  if (stored.columns.size() == 1) {
+    const int col_idx = get_column_index(stored.columns[0]);
+    Column &col = get_mutable_column(static_cast<size_t>(col_idx));
+    col.set_unique(true);
+    ensure_index_for_column(stored.columns[0]);
+  }
+  ensure_constraint_index(unique_constraint_index_name(stored), stored.columns);
+  mark_dirty();
+}
+
+bool Table::drop_unique_constraint(const std::vector<std::string> &columns) {
+  for (auto it = unique_constraints_.begin(); it != unique_constraints_.end();
+       ++it) {
+    if (it->columns != columns) {
+      continue;
+    }
+    drop_constraint_index(unique_constraint_index_name(*it));
+    if (columns.size() == 1) {
+      const int col_idx = get_column_index(columns[0]);
+      if (col_idx >= 0) {
+        Column &col = get_mutable_column(static_cast<size_t>(col_idx));
+        col.set_unique(false);
+        if (!col.is_primary_key()) {
+          drop_index(columns[0]);
+        }
+      }
+    }
+    unique_constraints_.erase(it);
+    mark_dirty();
+    return true;
+  }
+  // Legacy single-column UNIQUE flag only (no table-level entry).
+  if (columns.size() == 1) {
+    const int col_idx = get_column_index(columns[0]);
+    if (col_idx < 0) {
+      return false;
+    }
+    Column &col = get_mutable_column(static_cast<size_t>(col_idx));
+    if (!col.is_unique()) {
+      return false;
+    }
+    col.set_unique(false);
+    if (!col.is_primary_key()) {
+      drop_index(columns[0]);
+    }
+    mark_dirty();
+    return true;
+  }
+  return false;
+}
+
+std::string Table::primary_key_index_name() { return "__pk"; }
+
+std::string Table::unique_constraint_index_name(
+    const UniqueConstraintDefinition &constraint) {
+  if (!constraint.name.empty()) {
+    return "__uq_" + constraint.name;
+  }
+  std::string name = "__uq";
+  for (const std::string &col : constraint.columns) {
+    name += "_" + col;
+  }
+  return name;
+}
+
+void Table::ensure_constraint_index(
+    const std::string &index_name,
+    const std::vector<std::string> &column_names) {
+  constraint_indexes_[index_name] = column_names;
+  build_constraint_index(index_name);
+}
+
+void Table::drop_constraint_index(const std::string &index_name) {
+  constraint_indexes_.erase(index_name);
+  named_indices_.erase(index_name);
+}
+
+void Table::build_constraint_index(const std::string &index_name) {
+  auto it = constraint_indexes_.find(index_name);
+  if (it == constraint_indexes_.end()) {
+    return;
+  }
+  auto idx = std::make_unique<BTreeIndex>();
+  for (size_t i = 0; i < row_directory_.size(); ++i) {
+    idx->insert(build_index_key(get_row(i), it->second), i);
+  }
+  named_indices_[index_name] = std::move(idx);
+}
+
 bool Table::validate_check_constraints(const Row &row) const {
   return !find_violated_check(row).has_value();
 }
@@ -930,6 +1223,16 @@ void Table::reindex_after_delete() {
     }
   }
   for (const auto &[index_name, columns] : secondary_indexes_) {
+    auto it = named_indices_.find(index_name);
+    if (it == named_indices_.end()) {
+      continue;
+    }
+    it->second->clear();
+    for (size_t i = 0; i < row_directory_.size(); ++i) {
+      it->second->insert(build_index_key(get_row(i), columns), i);
+    }
+  }
+  for (const auto &[index_name, columns] : constraint_indexes_) {
     auto it = named_indices_.find(index_name);
     if (it == named_indices_.end()) {
       continue;

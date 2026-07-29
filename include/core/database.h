@@ -263,6 +263,8 @@ class Database {
       const std::shared_ptr<CreateTableStatement> &stmt);
   void register_checks_for_create(
       const std::shared_ptr<CreateTableStatement> &stmt);
+  void register_keys_for_create(
+      const std::shared_ptr<CreateTableStatement> &stmt);
   bool parent_has_key(const std::string &parent_table,
                       const std::vector<std::string> &parent_columns,
                       const std::vector<Value> &values) const;

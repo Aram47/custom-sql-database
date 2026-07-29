@@ -695,6 +695,15 @@ void CreateTableStatement::add_check(const CheckConstraintDefinition &check) {
   checks_.push_back(check);
 }
 
+void CreateTableStatement::set_primary_key(std::vector<std::string> columns) {
+  primary_key_columns_ = std::move(columns);
+}
+
+void CreateTableStatement::add_unique(std::string name,
+                                      std::vector<std::string> columns) {
+  unique_constraints_.emplace_back(std::move(name), std::move(columns));
+}
+
 const std::vector<ColumnDefinition> &CreateTableStatement::get_columns() const {
   return columns_;
 }
@@ -707,6 +716,16 @@ CreateTableStatement::get_foreign_keys() const {
 const std::vector<CheckConstraintDefinition> &
 CreateTableStatement::get_checks() const {
   return checks_;
+}
+
+const std::vector<std::string> &CreateTableStatement::get_primary_key_columns()
+    const {
+  return primary_key_columns_;
+}
+
+const std::vector<std::pair<std::string, std::vector<std::string>>> &
+CreateTableStatement::get_unique_constraints() const {
+  return unique_constraints_;
 }
 
 void CreateTableStatement::setPartitionBy(PartitionKind kind,
@@ -754,6 +773,26 @@ std::string CreateTableStatement::to_string() const {
   for (size_t i = 0; i < columns_.size(); ++i) {
     if (i > 0) oss << ", ";
     oss << columns_[i].to_string();
+  }
+  if (!primary_key_columns_.empty()) {
+    oss << ", PRIMARY KEY (";
+    for (size_t i = 0; i < primary_key_columns_.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << primary_key_columns_[i];
+    }
+    oss << ")";
+  }
+  for (const auto &[uq_name, uq_cols] : unique_constraints_) {
+    oss << ", ";
+    if (!uq_name.empty()) {
+      oss << "CONSTRAINT " << uq_name << " ";
+    }
+    oss << "UNIQUE (";
+    for (size_t i = 0; i < uq_cols.size(); ++i) {
+      if (i > 0) oss << ", ";
+      oss << uq_cols[i];
+    }
+    oss << ")";
   }
   for (const auto &fk : foreign_keys_) {
     oss << ", FOREIGN KEY (";

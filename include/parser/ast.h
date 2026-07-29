@@ -380,9 +380,14 @@ class CreateTableStatement {
   void add_column(const ColumnDefinition &col);
   void add_foreign_key(const ForeignKeyDefinition &fk);
   void add_check(const CheckConstraintDefinition &check);
+  void set_primary_key(std::vector<std::string> columns);
+  void add_unique(std::string name, std::vector<std::string> columns);
   const std::vector<ColumnDefinition> &get_columns() const;
   const std::vector<ForeignKeyDefinition> &get_foreign_keys() const;
   const std::vector<CheckConstraintDefinition> &get_checks() const;
+  const std::vector<std::string> &get_primary_key_columns() const;
+  const std::vector<std::pair<std::string, std::vector<std::string>>> &
+  get_unique_constraints() const;
 
   /** Marks this as a partitioned parent: PARTITION BY RANGE|HASH (col). */
   void setPartitionBy(PartitionKind kind, std::string keyColumn);
@@ -403,6 +408,9 @@ class CreateTableStatement {
   std::vector<ColumnDefinition> columns_;
   std::vector<ForeignKeyDefinition> foreign_keys_;
   std::vector<CheckConstraintDefinition> checks_;
+  std::vector<std::string> primary_key_columns_;
+  std::vector<std::pair<std::string, std::vector<std::string>>>
+      unique_constraints_;
   bool has_partition_by_{false};
   PartitionKind partition_kind_{PartitionKind::Range};
   std::string partition_key_column_;
@@ -443,6 +451,8 @@ struct AlterTableAction {
   std::string new_name;
   std::string check_name;
   ExpressionPtr check_expression;
+  /** Columns for ADD/DROP PRIMARY KEY or UNIQUE (supports composite). */
+  std::vector<std::string> columns;
 };
 
 class AlterTableStatement {

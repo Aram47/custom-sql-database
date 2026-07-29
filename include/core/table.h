@@ -16,6 +16,7 @@
 #include "core/partition.h"
 #include "core/row.h"
 #include "core/transaction_manager.h"
+#include "core/unique_constraint.h"
 #include "storage/buffer_pool.h"
 #include "storage/heap_file.h"
 #include "storage/item_pointer.h"
@@ -121,6 +122,25 @@ class Table {
   const std::vector<CheckConstraintDefinition> &get_checks() const;
   void set_checks(std::vector<CheckConstraintDefinition> checks);
 
+  /** Table-level PRIMARY KEY column list (empty = none / legacy flags only). */
+  const std::vector<std::string> &get_primary_key_columns() const;
+  void set_primary_key_columns(std::vector<std::string> columns);
+  /** Applies PRIMARY KEY: updates column flags + constraint index. */
+  void apply_primary_key(const std::vector<std::string> &columns);
+  /** Clears PRIMARY KEY flags and drops the PK constraint index. */
+  bool drop_primary_key();
+
+  const std::vector<UniqueConstraintDefinition> &get_unique_constraints() const;
+  void set_unique_constraints(
+      std::vector<UniqueConstraintDefinition> constraints);
+  /** Adds a table-level UNIQUE (and optional column unique_ flags for singles). */
+  void apply_unique_constraint(const UniqueConstraintDefinition &constraint);
+  /** Drops UNIQUE matching the given column list; returns false if missing. */
+  bool drop_unique_constraint(const std::vector<std::string> &columns);
+
+  /** Syncs primary_key_columns_ from Column::is_primary_key when empty. */
+  void sync_key_metadata_from_column_flags();
+
   bool validate_row(const Row &row,
                     size_t exclude_row_index = static_cast<size_t>(-1)) const;
   bool validate_primary_key_uniqueness(
@@ -186,6 +206,10 @@ class Table {
   std::map<std::string, std::vector<std::string>> secondary_indexes_;
   std::vector<ForeignKeyDefinition> foreign_keys_;
   std::vector<CheckConstraintDefinition> checks_;
+  std::vector<std::string> primary_key_columns_;
+  std::vector<UniqueConstraintDefinition> unique_constraints_;
+  /** Internal unique indexes backing PK / table UNIQUE (name → columns). */
+  std::map<std::string, std::vector<std::string>> constraint_indexes_;
   std::unique_ptr<PartitionedTableMetadata> partition_meta_;
   bool dirty_{false};
 
@@ -194,11 +218,21 @@ class Table {
   std::vector<DataType> collect_column_types() const;
   void build_index(const std::string &column_name);
   void build_named_index(const std::string &index_name);
+  void build_constraint_index(const std::string &index_name);
+  void ensure_constraint_index(const std::string &index_name,
+                               const std::vector<std::string> &column_names);
+  void drop_constraint_index(const std::string &index_name);
+  static std::string primary_key_index_name();
+  static std::string unique_constraint_index_name(
+      const UniqueConstraintDefinition &constraint);
   void insert_into_indexes(const Row &row, size_t row_index);
   void remove_from_indexes(const Row &row, size_t row_index);
   bool is_column_still_indexed(const std::string &column_name) const;
   void validate_schema(const Row &row) const;
   int get_primary_key_index() const;
+  bool rows_share_key(const IndexKey &key, size_t exclude_row_index,
+                      const std::string &index_name,
+                      const std::vector<std::string> &column_names) const;
   void reindex_after_delete();
   void replace_row(size_t index, const Row &row);
 };

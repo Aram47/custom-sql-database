@@ -11,6 +11,7 @@
 #include "core/index_key.h"
 #include "core/check_constraint.h"
 #include "core/partition_catalog.h"
+#include "core/unique_constraint.h"
 #include "core/view_expander.h"
 #include "executor/ddl_executor.h"
 #include "executor/join_select_executor.h"
@@ -990,6 +991,15 @@ bool Database::is_parent_key_supported(
   if (columns.empty()) {
     return false;
   }
+  const auto &pk = parent.get_primary_key_columns();
+  if (!pk.empty() && pk == columns) {
+    return true;
+  }
+  for (const auto &uq : parent.get_unique_constraints()) {
+    if (uq.columns == columns) {
+      return true;
+    }
+  }
   if (columns.size() == 1) {
     const int col_idx = parent.get_column_index(columns[0]);
     if (col_idx < 0) {
@@ -1327,6 +1337,27 @@ void Database::register_checks_for_create(
   }
 }
 
+void Database::register_keys_for_create(
+    const std::shared_ptr<CreateTableStatement> &stmt) {
+  Table *table = get_table(stmt->get_table_name());
+  if (!table) {
+    return;
+  }
+  table->sync_key_metadata_from_column_flags();
+  if (!stmt->get_primary_key_columns().empty()) {
+    if (!table->get_primary_key_columns().empty()) {
+      throw ConstraintException("Multiple PRIMARY KEY definitions");
+    }
+    table->apply_primary_key(stmt->get_primary_key_columns());
+  }
+  for (const auto &[name, columns] : stmt->get_unique_constraints()) {
+    UniqueConstraintDefinition uq;
+    uq.name = name;
+    uq.columns = columns;
+    table->apply_unique_constraint(uq);
+  }
+}
+
 QueryResult Database::execute_create_table_statement(
     std::shared_ptr<CreateTableStatement> stmt) {
   if (stmt->isPartitionOf()) {
@@ -1344,6 +1375,7 @@ QueryResult Database::execute_create_table_statement(
   QueryResult result = executor.execute();
   if (result.success) {
     try {
+      register_keys_for_create(stmt);
       register_foreign_keys_for_create(stmt);
       register_checks_for_create(stmt);
       if (stmt->hasPartitionBy()) {

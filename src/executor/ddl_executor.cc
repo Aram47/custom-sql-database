@@ -1,6 +1,7 @@
 #include "executor/ddl_executor.h"
 
 #include "core/check_constraint.h"
+#include "core/unique_constraint.h"
 #include "storage/persistence_manager.h"
 #include "types/data_type.h"
 
@@ -109,46 +110,44 @@ QueryResult AlterTableExecutor::execute() {
         table->rename_column(action.name, action.new_name);
         break;
       case AlterTableActionType::AddPrimaryKey: {
-        const int col_idx = table->get_column_index(action.name);
-        if (col_idx < 0) {
-          return QueryResult::error_result("Column '" + action.name +
-                                           "' not found");
-        }
-        for (size_t i = 0; i < table->get_column_count(); ++i) {
-          if (table->get_column(i).is_primary_key()) {
-            return QueryResult::error_result(
-                "Table already has a primary key");
+        const std::vector<std::string> &pk_cols =
+            action.columns.empty()
+                ? std::vector<std::string>{action.name}
+                : action.columns;
+        try {
+          table->apply_primary_key(pk_cols);
+          for (size_t i = 0; i < table->get_row_count(); ++i) {
+            if (!table->validate_row(table->get_row(i), i)) {
+              table->drop_primary_key();
+              return QueryResult::error_result(
+                  "Cannot add PRIMARY KEY: existing data violates constraint");
+            }
           }
+        } catch (const std::exception &e) {
+          return QueryResult::error_result(e.what());
         }
-        Column &col = table->get_mutable_column(static_cast<size_t>(col_idx));
-        col.set_primary_key(true);
-        for (size_t i = 0; i < table->get_row_count(); ++i) {
-          if (!table->validate_row(table->get_row(i), i)) {
-            col.set_primary_key(false);
-            return QueryResult::error_result(
-                "Cannot add PRIMARY KEY: existing data violates constraint");
-          }
-        }
-        table->ensure_index_for_column(action.name);
         table->mark_dirty();
         break;
       }
       case AlterTableActionType::AddUnique: {
-        const int col_idx = table->get_column_index(action.name);
-        if (col_idx < 0) {
-          return QueryResult::error_result("Column '" + action.name +
-                                           "' not found");
-        }
-        Column &col = table->get_mutable_column(static_cast<size_t>(col_idx));
-        col.set_unique(true);
-        for (size_t i = 0; i < table->get_row_count(); ++i) {
-          if (!table->validate_unique_constraint(table->get_row(i), i)) {
-            col.set_unique(false);
-            return QueryResult::error_result(
-                "Cannot add UNIQUE: existing data violates constraint");
+        const std::vector<std::string> &uq_cols =
+            action.columns.empty()
+                ? std::vector<std::string>{action.name}
+                : action.columns;
+        UniqueConstraintDefinition uq;
+        uq.columns = uq_cols;
+        try {
+          table->apply_unique_constraint(uq);
+          for (size_t i = 0; i < table->get_row_count(); ++i) {
+            if (!table->validate_unique_constraint(table->get_row(i), i)) {
+              table->drop_unique_constraint(uq_cols);
+              return QueryResult::error_result(
+                  "Cannot add UNIQUE: existing data violates constraint");
+            }
           }
+        } catch (const std::exception &e) {
+          return QueryResult::error_result(e.what());
         }
-        table->ensure_index_for_column(action.name);
         table->mark_dirty();
         break;
       }
@@ -172,39 +171,20 @@ QueryResult AlterTableExecutor::execute() {
         break;
       }
       case AlterTableActionType::DropPrimaryKey: {
-        bool found = false;
-        for (size_t i = 0; i < table->get_column_count(); ++i) {
-          Column &col = table->get_mutable_column(i);
-          if (col.is_primary_key()) {
-            const std::string col_name = col.get_name();
-            col.set_primary_key(false);
-            if (!col.is_unique()) {
-              table->drop_index(col_name);
-            }
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
+        if (!table->drop_primary_key()) {
           return QueryResult::error_result("Table has no primary key");
         }
         table->mark_dirty();
         break;
       }
       case AlterTableActionType::DropUnique: {
-        const int col_idx = table->get_column_index(action.name);
-        if (col_idx < 0) {
-          return QueryResult::error_result("Column '" + action.name +
-                                           "' not found");
-        }
-        Column &col = table->get_mutable_column(static_cast<size_t>(col_idx));
-        if (!col.is_unique()) {
-          return QueryResult::error_result("Column '" + action.name +
-                                           "' is not UNIQUE");
-        }
-        col.set_unique(false);
-        if (!col.is_primary_key()) {
-          table->drop_index(action.name);
+        const std::vector<std::string> &uq_cols =
+            action.columns.empty()
+                ? std::vector<std::string>{action.name}
+                : action.columns;
+        if (!table->drop_unique_constraint(uq_cols)) {
+          return QueryResult::error_result(
+              "UNIQUE constraint not found for given columns");
         }
         table->mark_dirty();
         break;

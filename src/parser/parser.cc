@@ -643,6 +643,54 @@ std::shared_ptr<CreateTableStatement> Parser::parse_create_table_statement() {
         consume(TokenType::IDENTIFIER, "Expected constraint name");
       }
       stmt->add_foreign_key(parse_table_foreign_key());
+    } else if (check(TokenType::PRIMARY) ||
+               (check(TokenType::CONSTRAINT) &&
+                peek_ahead(1).get_type() == TokenType::IDENTIFIER &&
+                peek_ahead(2).get_type() == TokenType::PRIMARY)) {
+      if (match(TokenType::CONSTRAINT)) {
+        consume(TokenType::IDENTIFIER, "Expected constraint name");
+      }
+      consume(TokenType::PRIMARY, "Expected PRIMARY");
+      consume(TokenType::KEY, "Expected KEY");
+      if (!stmt->get_primary_key_columns().empty()) {
+        throw ParseException(
+            get_error_message("Multiple PRIMARY KEY definitions"));
+      }
+      consume(TokenType::LPAREN, "Expected (");
+      std::vector<std::string> pk_columns;
+      do {
+        pk_columns.push_back(
+            consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme());
+      } while (match(TokenType::COMMA));
+      consume(TokenType::RPAREN, "Expected )");
+      if (pk_columns.empty()) {
+        throw ParseException(
+            get_error_message("PRIMARY KEY must list at least one column"));
+      }
+      stmt->set_primary_key(std::move(pk_columns));
+    } else if (check(TokenType::UNIQUE) ||
+               (check(TokenType::CONSTRAINT) &&
+                peek_ahead(1).get_type() == TokenType::IDENTIFIER &&
+                peek_ahead(2).get_type() == TokenType::UNIQUE)) {
+      std::string constraint_name;
+      if (match(TokenType::CONSTRAINT)) {
+        constraint_name =
+            consume(TokenType::IDENTIFIER, "Expected constraint name")
+                .get_lexeme();
+      }
+      consume(TokenType::UNIQUE, "Expected UNIQUE");
+      consume(TokenType::LPAREN, "Expected (");
+      std::vector<std::string> uq_columns;
+      do {
+        uq_columns.push_back(
+            consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme());
+      } while (match(TokenType::COMMA));
+      consume(TokenType::RPAREN, "Expected )");
+      if (uq_columns.empty()) {
+        throw ParseException(
+            get_error_message("UNIQUE must list at least one column"));
+      }
+      stmt->add_unique(std::move(constraint_name), std::move(uq_columns));
     } else {
       ColumnDefinition col = parse_column_definition();
       stmt->add_column(col);
@@ -1327,15 +1375,29 @@ std::shared_ptr<AlterTableStatement> Parser::parse_alter_table_statement() {
       consume(TokenType::KEY, "Expected KEY");
       consume(TokenType::LPAREN, "Expected (");
       action.type = AlterTableActionType::AddPrimaryKey;
-      action.name =
-          consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme();
+      do {
+        action.columns.push_back(
+            consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme());
+      } while (match(TokenType::COMMA));
       consume(TokenType::RPAREN, "Expected )");
+      if (action.columns.empty()) {
+        throw ParseException(
+            get_error_message("PRIMARY KEY must list at least one column"));
+      }
+      action.name = action.columns[0];
     } else if (match(TokenType::UNIQUE)) {
       consume(TokenType::LPAREN, "Expected (");
       action.type = AlterTableActionType::AddUnique;
-      action.name =
-          consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme();
+      do {
+        action.columns.push_back(
+            consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme());
+      } while (match(TokenType::COMMA));
       consume(TokenType::RPAREN, "Expected )");
+      if (action.columns.empty()) {
+        throw ParseException(
+            get_error_message("UNIQUE must list at least one column"));
+      }
+      action.name = action.columns[0];
     } else {
       throw ParseException(get_error_message(
           "Expected COLUMN, CHECK, PRIMARY KEY, or UNIQUE after ADD"));
@@ -1356,9 +1418,16 @@ std::shared_ptr<AlterTableStatement> Parser::parse_alter_table_statement() {
     } else if (match(TokenType::UNIQUE)) {
       consume(TokenType::LPAREN, "Expected (");
       action.type = AlterTableActionType::DropUnique;
-      action.name =
-          consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme();
+      do {
+        action.columns.push_back(
+            consume(TokenType::IDENTIFIER, "Expected column name").get_lexeme());
+      } while (match(TokenType::COMMA));
       consume(TokenType::RPAREN, "Expected )");
+      if (action.columns.empty()) {
+        throw ParseException(
+            get_error_message("UNIQUE must list at least one column"));
+      }
+      action.name = action.columns[0];
     } else {
       throw ParseException(get_error_message(
           "Expected COLUMN, CHECK, PRIMARY KEY, or UNIQUE after DROP"));
