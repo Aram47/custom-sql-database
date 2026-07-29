@@ -31,6 +31,11 @@ class TransactionManager {
                  const TransactionSnapshot *snapshot) const;
   /** Lowest snapshot xmax among active readers; safe GC cutoff. */
   uint64_t getVacuumHorizon() const;
+  /**
+   * True when freezing xid (xmin→0 / drop xmax==xid) will not change
+   * visibility for any still-active snapshot reader.
+   */
+  bool canFreezeCommitted(uint64_t xid) const;
 
  private:
   mutable std::mutex mutex_;

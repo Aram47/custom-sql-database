@@ -79,6 +79,21 @@ uint64_t TransactionManager::getVacuumHorizon() const {
   return horizon;
 }
 
+bool TransactionManager::canFreezeCommitted(uint64_t xid) const {
+  if (xid == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto &[owner, snapshot] : active_snapshots_) {
+    (void)owner;
+    // Same predicates as isVisible: these snapshots still treat xid as unseen.
+    if (xid >= snapshot.xmax || snapshot.active_xids.count(xid) > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool TransactionManager::isVisible(uint64_t xmin, uint64_t xmax,
                                    uint64_t reader_xid,
                                    const TransactionSnapshot *snapshot) const {

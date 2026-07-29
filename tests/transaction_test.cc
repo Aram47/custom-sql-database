@@ -166,5 +166,86 @@ TEST(TransactionTest, ConcurrentUpdatesOnDifferentRows) {
   EXPECT_EQ(r.rows[1][1].as_int(), 2);
 }
 
+TEST(TransactionTest, CommittedInsertVisibleAfterReload) {
+  test_util::TempDbDir tmp;
+  {
+    Database db(tmp.path_string(), /*vacuum_interval_ms=*/0);
+    SessionContext session;
+    ASSERT_TRUE(
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)", &session)
+            .success);
+    ASSERT_TRUE(db.execute_query("BEGIN", &session).success);
+    ASSERT_TRUE(db.execute_query("INSERT INTO t VALUES (1)", &session).success);
+    ASSERT_TRUE(db.execute_query("COMMIT", &session).success);
+  }
+
+  Database reloaded(tmp.path_string(), /*vacuum_interval_ms=*/0);
+  reloaded.load_from_disk();
+  auto r = reloaded.execute_query("SELECT id FROM t");
+  ASSERT_TRUE(r.success) << r.message;
+  ASSERT_EQ(r.rows.size(), 1u);
+  EXPECT_EQ(r.rows[0][0].as_int(), 1);
+}
+
+TEST(TransactionTest, RolledBackInsertAbsentAfterReload) {
+  test_util::TempDbDir tmp;
+  {
+    Database db(tmp.path_string(), /*vacuum_interval_ms=*/0);
+    SessionContext session;
+    ASSERT_TRUE(
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)", &session)
+            .success);
+    ASSERT_TRUE(db.execute_query("BEGIN", &session).success);
+    ASSERT_TRUE(db.execute_query("INSERT INTO t VALUES (1)", &session).success);
+    ASSERT_TRUE(db.execute_query("ROLLBACK", &session).success);
+  }
+
+  Database reloaded(tmp.path_string(), /*vacuum_interval_ms=*/0);
+  reloaded.load_from_disk();
+  auto r = reloaded.execute_query("SELECT id FROM t");
+  ASSERT_TRUE(r.success) << r.message;
+  EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST(TransactionTest, CommittedDeleteAbsentAfterReload) {
+  test_util::TempDbDir tmp;
+  {
+    Database db(tmp.path_string(), /*vacuum_interval_ms=*/0);
+    SessionContext session;
+    ASSERT_TRUE(
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)", &session)
+            .success);
+    ASSERT_TRUE(db.execute_query("BEGIN", &session).success);
+    ASSERT_TRUE(db.execute_query("INSERT INTO t VALUES (1)", &session).success);
+    ASSERT_TRUE(db.execute_query("COMMIT", &session).success);
+    ASSERT_TRUE(db.execute_query("BEGIN", &session).success);
+    ASSERT_TRUE(db.execute_query("DELETE FROM t WHERE id = 1", &session).success);
+    ASSERT_TRUE(db.execute_query("COMMIT", &session).success);
+  }
+
+  Database reloaded(tmp.path_string(), /*vacuum_interval_ms=*/0);
+  reloaded.load_from_disk();
+  auto r = reloaded.execute_query("SELECT id FROM t");
+  ASSERT_TRUE(r.success) << r.message;
+  EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST(TransactionTest, NonTxInsertVisibleAfterReload) {
+  test_util::TempDbDir tmp;
+  {
+    Database db(tmp.path_string(), /*vacuum_interval_ms=*/0);
+    ASSERT_TRUE(
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)").success);
+    ASSERT_TRUE(db.execute_query("INSERT INTO t VALUES (42)").success);
+  }
+
+  Database reloaded(tmp.path_string(), /*vacuum_interval_ms=*/0);
+  reloaded.load_from_disk();
+  auto r = reloaded.execute_query("SELECT id FROM t");
+  ASSERT_TRUE(r.success) << r.message;
+  ASSERT_EQ(r.rows.size(), 1u);
+  EXPECT_EQ(r.rows[0][0].as_int(), 42);
+}
+
 }  // namespace
 }  // namespace db

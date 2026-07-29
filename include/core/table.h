@@ -67,6 +67,11 @@ class Table {
   void delete_row(size_t index);
   void delete_row_versioned(size_t index, uint64_t xid);
   void delete_all();
+  /**
+   * After COMMIT of xid: make versions self-describing for disk durability.
+   * Live rows with xmin==xid get xmin=0; versions with xmax==xid are dropped.
+   */
+  void freeze_committed_versions(uint64_t xid);
   /** Removes aborted inserts and clears aborted deletes; drops committed deletes. */
   void vacuum_versions(const TransactionManager &txn_manager);
   void vacuum_versions(const TransactionManager &txn_manager,

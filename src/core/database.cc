@@ -2067,6 +2067,14 @@ QueryResult Database::execute_commit(SessionContext *session) {
   const uint64_t txn_id = session->get_transaction_id();
   transaction_manager_.commitTransaction(txn_id);
   vacuum_all_tables();
+  // Freeze versioned rows so COMMIT survives restart without RAM statuses_.
+  // Skip while older snapshots still need xid visibility (SI safety).
+  if (transaction_manager_.canFreezeCommitted(txn_id)) {
+    for (auto &[name, table] : tables_) {
+      (void)name;
+      table->freeze_committed_versions(txn_id);
+    }
+  }
   QueryResult result = persist_dirty_tables(QueryResult::success_result("COMMIT OK"),
                                             false);
   if (!result.success) {

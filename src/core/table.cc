@@ -456,6 +456,38 @@ void Table::delete_row_versioned(size_t index, uint64_t xid) {
   mark_dirty();
 }
 
+void Table::freeze_committed_versions(uint64_t xid) {
+  if (xid == 0) {
+    return;
+  }
+  std::vector<Row> kept;
+  kept.reserve(row_directory_.size());
+  bool changed = false;
+  for (const ItemPointer &pointer : row_directory_) {
+    Row row = heap_->get_row(pointer);
+    if (row.get_xmax() == xid) {
+      changed = true;
+      continue;
+    }
+    if (row.get_xmin() == xid) {
+      row.set_xmin(0);
+      changed = true;
+    }
+    kept.push_back(std::move(row));
+  }
+  if (!changed) {
+    return;
+  }
+  heap_->clear();
+  row_directory_.clear();
+  sync_heap_column_types();
+  for (const Row &row : kept) {
+    row_directory_.push_back(heap_->insert_row(row));
+  }
+  rebuild_indexes();
+  mark_dirty();
+}
+
 void Table::vacuum_versions(const TransactionManager &txn_manager) {
   vacuum_versions(txn_manager, txn_manager.getVacuumHorizon());
 }
